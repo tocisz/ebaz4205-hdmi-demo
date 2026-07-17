@@ -14,7 +14,11 @@ the Linux FPGA Manager framework and Device Tree Overlays:
 | `CONFIG_OF_CONFIGFS` | `/sys/kernel/config/device-tree/overlays/` interface | ✅ (new — kernel #3) |
 | `CONFIG_OF_FPGA_REGION` | Overlay → FPGA programming orchestration | ✅ (new — kernel #3) |
 
-### Verified at runtime (kernel #3, 2026-07-15)
+### Verified at runtime (2026-07-17, tested end-to-end)
+
+The overlay is now applied at boot by `/etc/init.d/S20fpgaregion` via configfs
+(instead of U-Boot `fdt apply`). This gives the kernel full overlay lifecycle
+tracking — the overlay can be removed and re-applied cleanly at runtime.
 
 ```
 # fpga-region DT node:
@@ -25,24 +29,36 @@ fpga-region
 $ ls /sys/class/fpga_region/
 region0
 
-# Driver binding:
-$ cat /sys/class/fpga_region/region0/device/uevent
-DRIVER=of-fpga-region
-OF_NAME=fpga-region
-OF_COMPATIBLE_0=fpga-region
-
 # FPGA manager:
 $ cat /sys/class/fpga_manager/fpga0/state
 operating
 
-# ConfigFS overlay interface:
+# ConfigFS overlay interface — "pl" overlay active (applied by init script):
 $ ls /sys/kernel/config/device-tree/overlays/
-(empty — no active overlays)
+pl
 
-# ConfigFS persisted across reboots via /etc/fstab
+# All PL devices present after overlay applied:
+$ ls /sys/class/leds/
+led0:green  led0:red  led1:aux0  led1:aux1  led1:aux2  mmc0::
+
+$ ls /dev/fb0
+/dev/fb0
+
+$ ls /sys/bus/iio/devices/
+iio:device0  iio:device1        # xadc + mwipcore0:hdmi_sink
+
+# Overlay can be removed and re-applied at runtime:
+$ rmdir /sys/kernel/config/device-tree/overlays/pl
+$ ls /sys/class/leds/
+mmc0::                           # only MMC LED remains
+
+$ mkdir -p /sys/kernel/config/device-tree/overlays/pl
+$ cat /mnt/pl-ebaz4205.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
+$ ls /sys/class/leds/
+led0:green  led0:red  led1:aux0  led1:aux1  led1:aux2  mmc0::   # all back
 ```
 
-The configfs mount is now part of `/etc/fstab` (added in `post-build.sh` for future builds):
+The configfs mount is part of `/etc/fstab` (added in `post-build.sh`):
 
 ```
 configfs  /sys/kernel/config  configfs  defaults  0  0
@@ -96,17 +112,25 @@ With the local oscillator, the PHY is **completely independent** of the PL state
 Ethernet survives full PL reconfiguration — the `macb` driver never sees link drop.
 No serial console or script workarounds are needed; SSH over `eth0` stays up.
 
-### Simple hot-reload via SSH (no workaround needed)
+### Simple hot-reload via SSH (tested, working)
 
-Now that the PHY has its own clock, you can do a full PL reconfiguration over SSH
-without any prep work:
+Now that the PHY has its own clock and the overlay is managed by the kernel
+(via configfs, not U-Boot), you can do a full PL reconfiguration over SSH:
 
 ```bash
-# Simply load the new bitstream — Ethernet stays up the entire time
-fpgautil -b new_design.bit.bin -f Full
+# 1. Remove current PL overlay (unbinds drivers, removes DT nodes)
+rmdir /sys/kernel/config/device-tree/overlays/pl
+
+# 2. Program new bitstream (Ethernet stays up throughout)
+fpgautil -b /mnt/new_design.bit.bin -f Full
+
+# 3. Apply new overlay (adds DT nodes for new design, probes drivers)
+mkdir -p /sys/kernel/config/device-tree/overlays/pl
+cat /mnt/new_overlay.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
 ```
 
 No need to unbind `macb`, no dropped SSH session, no UART console required.
+The kernel tracks the overlay lifecycle, so removal/re-application is clean.
 
 ---
 
@@ -157,26 +181,47 @@ The kernel:
 3. Freezes bridges
 4. (Leaves FPGA in whatever state it was programmed to — does NOT clear it)
 
-### Limitations on the current setup
+### ✅ Limitations resolved
 
-The EBAZ4205 board has PL peripheral nodes (mwipcore, LCD, GPIO EMIO, PWM beeper)
-**hardcoded in the base device tree**. This means:
+**The base DT has been restructured (2025-07-17).** All PL peripheral nodes have been
+moved out of `zynq-ebaz4205.dts` and into the `pl-ebaz4205.dtso` overlay. The base DT
+now contains only PS hard IP plus the `fpga-region` node (inherited from `zynq-7000.dtsi`).
 
-1. **Drivers bind at boot** — before any overlay exists
-2. **Applying an overlay that reconfigures the PL** would change hardware
-   underneath already-running drivers → bus errors or hangs
-3. **The overlay isn't self-consistent** — the base DT assumes the current bitstream;
-   replacing it means the base DT nodes no longer describe the hardware
+**Overlay application at boot:** The overlay is applied by the `/etc/init.d/S20fpgaregion`
+init script via configfs (`/sys/kernel/config/device-tree/overlays/`). This is critical —
+because the kernel tracks configfs-applied overlays, they can be **removed cleanly at
+runtime** (`rmdir`), which is not possible when overlays are merged by U-Boot before boot.
 
-For full runtime reconfiguration to work cleanly, the base DT should contain **only the
-PS (hard IP)** plus the `fpga-region` node — no PL peripheral nodes. All PL device nodes
-should be in the overlay alongside `firmware-name`. This way:
+**U-Boot change:** U-Boot now uses `CONFIG_OF_SEPARATE=y` (instead of `CONFIG_OF_BOARD=y`),
+so it loads the base DTB (`devicetree.dtb`, PS-only) from the FAT partition and passes it
+to the kernel. The `boot.cmd` does **not** apply any DT overlay — that is deferred to
+userspace init for proper lifecycle tracking.
 
-- Base DT: PS peripherals (UART, SD card, NAND, Ethernet), fpga-region
-- Overlay: firmware-name + child nodes for PL devices
+**Benefits of the new structure:**
 
-Alternatively, use **partial reconfiguration** (see below) to keep the static peripherals
-running while swapping only the dynamic region.
+1. **Drivers bind only after overlay is applied** — PL devices appear when configfs
+   overlay is created, not at kernel probe time
+2. **Full overlay lifecycle** — remove (`rmdir`) and re-apply works; the kernel tracks
+   which nodes were added and can unbind drivers / delete nodes cleanly
+3. **Hot-reload ready** — swap the PL design by removing the old overlay, reprogramming
+   the FPGA via `fpgautil`, and applying a new overlay with matching device nodes
+
+**What the overlay covers:**
+
+| Node | Why it's in the overlay |
+|---|---|
+| `leds` (GPIO 54-58) | EMIO GPIOs → need PL routing |
+| `emio_keys` (GPIO 59-63) | EMIO GPIOs → need PL routing |
+| `beeper` | TTC0 PWM output via EMIO |
+| `ext_clk_50m` | PL reference clock |
+| `st7789v@0` (LCD) | SPI0 routed through EMIO |
+| `hdmi_sink_dma` | AXI DMAC in PL |
+| `mwipcore0` | PL IP core |
+
+**Remaining in base DTS:** All PS peripherals (MIO-based), the restart key on GPIO 20,
+and the `fpga-region` container from the SoC DTSI.
+
+For full details on the restructuring, see [section 2](#2--restructure-base-device-tree-done--2025-07-17).
 
 ---
 
@@ -306,34 +351,144 @@ removed from the FPGA design. FCLK_CLK1 disabled in PS. `fclk-enable` in DT set 
 **Impact:** The `macb` driver never needs to be unbound. Ethernet and SSH survive
 full PL reconfiguration without any workarounds.
 
-### 2. 🟡 Restructure base device tree
+### 2. ✅ Restructure base device tree (DONE — 2025-07-17)
 
-Move all PL peripheral nodes out of `zynq-ebaz4205.dts` and into a `pl.dtsi` overlay.
-The base DT would only have:
+**Status:** ✅ Base DT restructured. All PL-dependent nodes moved from `zynq-ebaz4205.dts`
+into a separate DT overlay `pl-ebaz4205.dtso`. Only PS peripherals remain in the base DTS.
 
-```dts
-/ {
-    // PS hard IP only: UART, SD card, NAND, Ethernet, TTC0, SPI0, GPIO
-    // fpga-region with fpga-mgr = <&devcfg>, no children, no firmware-name
-};
-```
+**Changes to `u-boot-xlnx/arch/arm/dts/zynq-ebaz4205.dts`:**
 
-Then a boot-time overlay adds the PL devices:
+| Removed from base DTS | Reason | New location |
+|---|---|---|
+| `leds` node (GPIO 54-58) | EMIO → needs PL routing | `pl-ebaz4205.dtso` inside `&amba` |
+| `key0`–`key4` (GPIO 59-63) | EMIO → needs PL routing | `pl-ebaz4205.dtso` inside `&amba` |
+| `beeper` (TTC0 PWM) | EMIO output needs PL routing | `pl-ebaz4205.dtso` inside `&amba` |
+| `ext_clk_50m` | PL reference clock | `pl-ebaz4205.dtso` inside `&amba` |
+| `st7789v@0` (LCD) | SPI0 routed via EMIO | `pl-ebaz4205.dtso` fragment targeting `&spi0` |
+| `amba: axi` bus + children | PL AXI peripherals (DMAC, mwipcore) | `pl-ebaz4205.dtso` inside `&amba` |
+
+**Kept in base DTS (PS hard IP, always works):**
+- `&gem0` — Ethernet (MIO)
+- `&sdhci0` — SD card (MIO)
+- `&uart0`, `&uart1` — UART (MIO)
+- `&gpio0` — PS GPIO controller
+- `&spi0` — SPI controller (children moved to overlay)
+- `&smcc`, `&nfc0` — NAND (MIO)
+- `&ttc0` — TTC0 timer (PWM property kept for framework)
+- `&clkc` — Clock controller
+- `keys` node with restart key only (GPIO 20 = MIO)
+- `fpga_full: fpga-region` — inherited from `zynq-7000.dtsi`
+
+**New file — `pl-ebaz4205.dtso`:**
+
+The overlay targets `&amba` (the AXI bus) and `&spi0`, adding all PL peripheral
+nodes. It is compiled with `cpp -U linux` + `dtc -@` to produce `pl-ebaz4205.dtbo`.
+The `-U linux` flag prevents the CPP preprocessor from expanding `linux` to `1`,
+which would mangle property names like `linux,default-trigger`.
 
 ```dts
 /dts-v1/;
 /plugin/;
-&fpga-region {
-    firmware-name = "ebaz4205_top.bit.bin";
-    mwipcore: axi:mwipcore@0 { ... };
-    // LCD, HDMI, GPIO-EMIO routing, etc.
+
+&amba {
+    // Add firmware-name here to trigger FPGA programming at overlay apply:
+    // firmware-name = "system_top.bit.bin";
+
+    leds { ... };          // EMIO GPIO 54-58
+    emio_keys { ... };     // EMIO GPIO 59-63
+    beeper { ... };        // TTC0 PWM via EMIO
+    ext_clk_50m { ... };   // PL reference clock
+    hdmi_sink_dma: dma@7c420000 { ... };  // AXI DMAC
+    mwipcore0: mwipcore@0 { ... };        // MathWorks IIO wrapper
+};
+
+&spi0 {
+    st7789v@0 { ... };     // LCD via EMIO SPI
 };
 ```
 
-This matches the overlay design pattern: bitstream + device nodes travel together.
+The overlay is compiled from `u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso` by the
+project Makefile using `cpp -U linux` + `dtc -@` and copied to `build_sdimg/`.
+`build/system_top.bit.bin` is also generated (via `bootgen -process_bitstream bin`)
+from `system_top.bit` and placed on the SD card for use by `fpgautil` or the
+overlay's `firmware-name`.
 
-**Note:** With the PHY crystal installed, you can boot with a blank PL and let the
-overlay load everything — the `clk_25m` stub bitstream is no longer required.
+**Boot-time overlay application (`/etc/init.d/S20fpgaregion`):**
+
+The init script runs at boot (order S20) and applies the overlay via configfs:
+
+```sh
+mount /dev/mmcblk0p1 /mnt 2>/dev/null || true
+mkdir -p /sys/kernel/config/device-tree/overlays/pl
+cat /mnt/pl-ebaz4205.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
+```
+
+Because the overlay is applied by the **kernel** (not U-Boot), the kernel tracks
+it in its overlay list. This means it can later be removed with:
+
+```bash
+rmdir /sys/kernel/config/device-tree/overlays/pl
+```
+
+U-Boot merged overlays would appear as native DT nodes and couldn't be removed.
+
+**SD card boot partition contents** (all files from `build_sdimg/`):
+
+| File | Purpose |
+|---|---|
+| `BOOT.bin` | FSBL + bitstream + U-Boot + base DTB |
+| `boot.scr` | U-Boot boot script (loads kernel + base DTB, no overlay) |
+| `devicetree.dtb` | Base device tree (PS peripherals only) |
+| `uImage` | Linux kernel |
+| `pl-ebaz4205.dtbo` | PL device tree overlay (applied by init script) |
+| `system_top.bit.bin` | Full bitstream for runtime reconfiguration |
+
+**U-Boot configuration change:**
+
+`CONFIG_OF_BOARD=y` was replaced with `CONFIG_OF_SEPARATE=y` in
+`zynq_ebaz4205_defconfig`. This forces U-Boot to use its own appended DTB
+(compiled from `zynq-ebaz4205.dts`) for its control FDT, and properly pass
+the DTB loaded from the FAT partition (`devicetree.dtb`) to the kernel via
+`bootm ${kernel_addr_r} - ${fdt_addr_r}`.
+
+**Applying the overlay at runtime** (only needed when swapping designs):
+
+```bash
+# Copy bitstream to firmware directory
+scp build/system_top.bit.bin root@ebaz:/lib/firmware/
+
+# Apply overlay via configfs
+mkdir -p /sys/kernel/config/device-tree/overlays/pl
+cat pl-ebaz4205.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
+
+# Check that PL devices appeared
+ls /sys/class/fpga_manager/fpga0/state        # "operating"
+ls /sys/class/fpga_region/region0/devices/     # PL devices listed
+```
+
+**Note:** The FPGA is programmed at boot by BOOT.bin (FSBL stage). The init script
+only adds the DT overlay for device nodes — `firmware-name` is intentionally **not**
+in the overlay. For runtime reconfiguration, you can either:
+- Use `fpgautil -b system_top.bit.bin -f Full` directly (Ethernet stays up), or
+- Add `firmware-name` to the overlay, copy the `.bit.bin` to `/lib/firmware/`,
+  and apply the modified overlay via configfs to program FPGA + add nodes atomically.
+
+**Known issues fixed during implementation:**
+
+| Issue | Fix |
+|---|---|
+| `linux,default-trigger` mangled to `1,default-trigger` by CPP | `-U linux` added to CPP flags in Makefile |
+| `mwipcore0` missing from overlay (removed from base DTS but not added to `.dtso`) | Added `mwipcore@0` node with `stream-channel` and `data-channel` to overlay |
+| Heartbeat LED showed `[none]` due to mangled property name | Resolved by `-U linux` fix above |
+
+**Removal:**
+
+```bash
+rmdir /sys/kernel/config/device-tree/overlays/pl
+```
+
+This unbinds the PL device drivers and removes the overlay nodes, but leaves the
+FPGA in its programmed state.
 
 ### 3. 🟢 Implement partial reconfiguration
 

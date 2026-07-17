@@ -66,6 +66,17 @@ build/uboot-env.bin: build/uboot-env.txt
 build/devicetree.dtb: u-boot-xlnx/u-boot.dtb | build
 	cp $< $@
 
+### Device Tree Overlay ###
+
+build/pl-ebaz4205.dtbo: u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso | build
+	cpp -P -x assembler-with-cpp \
+		-U linux \
+		-I u-boot-xlnx/dts/upstream/include \
+		-I u-boot-xlnx/arch/arm/dts \
+		$< $(basename $@).pre.tmp
+	dtc -@ -I dts -O dtb -o $@ $(basename $@).pre.tmp
+	rm -f $(basename $@).pre.tmp
+
 ### Linux ###
 
 menuconfig: TOOLCHAIN
@@ -112,6 +123,13 @@ build/sdk/fsbl/Release/fsbl.elf build/system_top.bit: build/system_top.xsa
 build/fsbl.elf: build/sdk/fsbl/Release/fsbl.elf
 	cp $< $@
 
+### FPGA bitstream (full reconfiguration) ###
+
+build/system_top.bit.bin: build/system_top.bit
+	printf 'all:\n{\n    %s\n}' $< > build/bitstream.bif
+	bash -c "source $(VIVADO_SETTINGS) && bootgen -image build/bitstream.bif -arch zynq -process_bitstream bin -w -o $@"
+	rm -f build/bitstream.bif
+
 ### boot.bin ###
 
 build/boot.bin: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb
@@ -122,7 +140,7 @@ build/boot.bin: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devic
 
 SDIMGDIR = $(CURDIR)/build_sdimg
 
-sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb build/uboot-env.bin build/uImage u-boot-xlnx/tools/mkimage
+sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb build/uboot-env.bin build/uImage build/pl-ebaz4205.dtbo build/system_top.bit.bin u-boot-xlnx/tools/mkimage
 	rm -rf $(SDIMGDIR)
 	mkdir -p $(SDIMGDIR)
 	cp build/fsbl.elf       $(SDIMGDIR)/fsbl.elf
@@ -130,6 +148,8 @@ sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb
 	cp build/u-boot.elf     $(SDIMGDIR)/u-boot.elf
 	cp build/uImage         $(SDIMGDIR)/uImage
 	cp build/devicetree.dtb $(SDIMGDIR)/devicetree.dtb
+	cp build/pl-ebaz4205.dtbo $(SDIMGDIR)/pl-ebaz4205.dtbo
+	cp build/system_top.bit.bin $(SDIMGDIR)/system_top.bit.bin
 #	cp build/uboot-env.bin  $(SDIMGDIR)/uboot.env
 	u-boot-xlnx/tools/mkimage -A arm -T script -C none -n "Boot script" -d scripts/boot.cmd $(SDIMGDIR)/boot.scr
 	echo "img : {[bootloader] $(SDIMGDIR)/fsbl.elf $(SDIMGDIR)/system_top.bit $(SDIMGDIR)/u-boot.elf [load = 0x00100000] $(SDIMGDIR)/devicetree.dtb}" > $(SDIMGDIR)/boot.bif
