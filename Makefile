@@ -123,8 +123,8 @@ build/boot.bin: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devic
 SDIMGDIR = $(CURDIR)/build_sdimg
 
 sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb build/uboot-env.bin build/uImage u-boot-xlnx/tools/mkimage
-	rm -r $(SDIMGDIR)
-	mkdir $(SDIMGDIR)
+	rm -rf $(SDIMGDIR)
+	mkdir -p $(SDIMGDIR)
 	cp build/fsbl.elf       $(SDIMGDIR)/fsbl.elf
 	cp build/system_top.bit $(SDIMGDIR)/system_top.bit
 	cp build/u-boot.elf     $(SDIMGDIR)/u-boot.elf
