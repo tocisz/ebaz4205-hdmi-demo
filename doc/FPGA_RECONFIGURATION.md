@@ -52,7 +52,9 @@ configfs  /sys/kernel/config  configfs  defaults  0  0
 
 ## The Ethernet PHY Clock Problem
 
-### Hardware path
+### Hardware path (solved — PHY crystal installed)
+
+**Original (FPGA-supplied clock, now removed):**
 
 ```
 PS IO PLL (999 MHz)
@@ -64,74 +66,47 @@ PS IO PLL (999 MHz)
   → PHY generates GMII_rx_clk, GMII_tx_clk → back to FPGA pins U14, U15
 ```
 
-The EBAZ4205 board has **no 25 MHz quartz crystal** for the Ethernet PHY. The PHY relies
-entirely on the FPGA to supply its master reference clock. This works fine as long as the
-PL remains configured, but breaks during any runtime reconfiguration:
-
-| Phase | PL state | `clk_25m` output | PHY behavior | Ethernet link |
-|---|---|---|---|---|
-| Normal operation | Configured | 25 MHz stable | Locked | Up |
-| PL reconfig in progress | Blank/erased | **0 V / floating** | Loses reference PLL lock | **Down** |
-| Post-reconfig | New bitstream loaded | 25 MHz stable again | Re-acquires lock (~50-200 ms) | Re-negotiates |
-
-During the blank period (100-500 ms for a full Zynq-7010 reconfiguration):
-
-1. The PHY's analog PLL loses lock
-2. `GMII_rx_clk` and `GMII_tx_clk` stop or become unstable
-3. The `macb` driver detects carrier loss
-4. Any SSH session over `eth0` drops
-5. After the new bitstream loads, the PHY needs time to re-lock and re-negotiate
-   (autonegotiation restart + DHCP if applicable)
-
-### Solution: Add a hardware oscillator
-
-The proper fix is to add a **dedicated 25 MHz CMOS oscillator** to the PHY:
+**Current (dedicated oscillator, installed):**
 
 ```
 ┌─────────────┐
 │  25 MHz     │  VCC ── 3.3V
 │  Oscillator │  GND ── GND
-│  (XO)       │  OUT ── PHY XTAL_IN (cut trace from FPGA pin U18)
+│  (XO)       │  OUT ── PHY XTAL_IN (PCB trace from FPGA pin U18 cut)
 └─────────────┘
 ```
 
-Recommended parts:
-- **Abracon ASFL1-25.000MHZ-EC-T** (3.2×2.5 mm SMD, 3.3V, ±50 ppm)
-- **SiTime SIT8008BI-73-33E-25.000000** (2.0×1.6 mm, 3.3V, ±50 ppm, smaller)
-- **ECS-2532HS-250-3-G** (2.5×2.0 mm, 3.3V, ±30 ppm)
+The EBAZ4205 board originally had **no 25 MHz quartz crystal** for the Ethernet PHY.
+The PHY relied entirely on the FPGA to supply its master reference clock. This worked
+fine as long as the PL remained configured, but broke during any runtime reconfiguration.
 
-Any 3.3V CMOS oscillator at 25.000 MHz with ±50 ppm or better will work. The FPGA pin
-U18 can then be repurposed or left as-is (if the PCB trace is cut, there's no conflict).
+**The 25 MHz crystal oscillator has been added to the hardware** (2025-07-17). The
+FPGA-based clock generation has been removed from the PL design:
 
-With a local oscillator, the PHY is **completely independent** of the PL state. Ethernet
-survives full PL reconfiguration — the `macb` driver never sees link drop.
+| Change | Details |
+|---|---|
+| `output clk_25m` port removed from `system_top.v` | No longer drives FPGA pin U18 |
+| OBUF `ext_clk_25m_obuf` removed | No output buffer for PHY clock |
+| FCLK_CLK1 disabled in PS (`PCW_EN_CLK1_PORT=0`) | PS no longer generates 25 MHz |
+| `create_bd_port -dir O clk_25m` removed from BD | No longer part of block design |
+| `clk_25m` constraints removed from XDC | Pin U18 freed up |
+| `fclk-enable` changed to `<0x1>` in DT | Only FCLK_CLK0 enabled (AXI fabric) |
 
-### Workaround (no hardware mod): scripted reconfiguration
+With the local oscillator, the PHY is **completely independent** of the PL state.
+Ethernet survives full PL reconfiguration — the `macb` driver never sees link drop.
+No serial console or script workarounds are needed; SSH over `eth0` stays up.
 
-If the oscillator mod isn't done yet, you can still reconfigure the PL by accepting
-the Ethernet link flap. The key steps:
+### Simple hot-reload via SSH (no workaround needed)
+
+Now that the PHY has its own clock, you can do a full PL reconfiguration over SSH
+without any prep work:
 
 ```bash
-# 1. Unbind PL-dependent drivers
-echo axi:mwipcore@0 > /sys/bus/platform/drivers/mwipcore/unbind 2>/dev/null
-
-# 2. Unbind macb (PHY will lose clock) — THIS KILLS SSH OVER eth0!
-echo e000b000.ethernet > /sys/bus/platform/drivers/macb/unbind
-
-# 3. Load new bitstream
+# Simply load the new bitstream — Ethernet stays up the entire time
 fpgautil -b new_design.bit.bin -f Full
-
-# 4. Rebind macb (PHY re-locks, link re-negotiates)
-echo e000b000.ethernet > /sys/bus/platform/drivers/macb/bind
-
-# 5. Rebind PL drivers (if compatible with new bitstream)
-echo axi:mwipcore@0 > /sys/bus/platform/drivers/mwipcore/bind 2>/dev/null
 ```
 
-Since step 2 kills the SSH session, you **must** run this from:
-- A UART console (UART0 on EMIO header pins H16/H17 at 3.3V LVCMOS — hook up a USB-UART dongle)
-- A button-triggered init script (the board has 5 GPIO buttons via the expansion board)
-- `nohup` / `at` with a reconnect loop on your workstation
+No need to unbind `macb`, no dropped SSH session, no UART console required.
 
 ---
 
@@ -281,7 +256,7 @@ fpga-bridge@4400 {
 
 | Benefit | Details |
 |---|---|
-| **Ethernet survives** | Static region keeps `clk_25m` → PHY never loses clock |
+| **Ethernet survives** | PHY has its own crystal → always has a clock source |
 | **LCD/GPIO continue** | SPI0 EMIO, GPIO EMIO, TTC0 PWM are in static region |
 | **HDMI hot-swap** | Swap video processing pipelines (different resolutions, effects) without rebooting |
 | **Safer AXI** | The bridge freezes AXI traffic → no bus hangs during reconfig |
@@ -319,13 +294,17 @@ Partial reconfiguration requires both **HDL tooling changes** and **kernel setup
 
 ## Practical Improvements (Priority Order)
 
-### 1. 🔴 Add PHY crystal (highest priority)
+### 1. ✅ Add PHY crystal (DONE — 2025-07-17)
 
-Without this, any PL reconfiguration kills Ethernet. A $1 oscillator soldered to the PHY
-makes PL reconfig a non-issue for the rest of the system.
+**Status:** ✅ Hardware mod complete. 25 MHz CMOS oscillator soldered to the PHY,
+PCB trace from FPGA pin U18 cut.
 
-**When done:** The `macb` driver never needs to be unbound. The serial console and
-Ethernet remain available during the entire reconfig cycle.
+**HDL changes:** `clk_25m` output port, OBUF, FCLK_CLK1 connection, and XDC constraints
+removed from the FPGA design. FCLK_CLK1 disabled in PS. `fclk-enable` in DT set to `<0x1>`
+(only FCLK_CLK0 for AXI fabric).
+
+**Impact:** The `macb` driver never needs to be unbound. Ethernet and SSH survive
+full PL reconfiguration without any workarounds.
 
 ### 2. 🟡 Restructure base device tree
 
@@ -353,9 +332,8 @@ Then a boot-time overlay adds the PL devices:
 
 This matches the overlay design pattern: bitstream + device nodes travel together.
 
-**Challenge:** The PL has to be blank when the kernel boots, or you need a "stub" bitstream
-in BOOT.bin that only provides `clk_25m`. If the PHY has a crystal, you can boot with a
-blank PL and let the overlay load everything.
+**Note:** With the PHY crystal installed, you can boot with a blank PL and let the
+overlay load everything — the `clk_25m` stub bitstream is no longer required.
 
 ### 3. 🟢 Implement partial reconfiguration
 
