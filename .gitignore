@@ -38,3 +38,8 @@
 build/
 build_sdimg/
 .Xil
+
+# Vivado xsim simulation artifacts
+*.pb
+xelab.log
+xvlog.log
