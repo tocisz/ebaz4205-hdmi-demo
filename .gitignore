@@ -43,3 +43,7 @@ build_sdimg/
 *.pb
 xelab.log
 xvlog.log
+
+# Brainfuck demo generated artifacts
+demos/brainfuck_org/bin/
+demos/brainfuck_org/__pycache__/
