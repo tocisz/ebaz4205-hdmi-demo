@@ -4,6 +4,19 @@
 
 Run the `bf1` Brainfuck CPU in the PL fabric of the EBAZ4205 (Zynq-7010), controlled from Linux on the PS. The UART character device (`/dev/ttyUL1`) that currently does `c → c+1` loopback will instead serve as bf1's I/O for the `,` (input) and `.` (output) Brainfuck instructions. The PS can halt/resume/step the CPU, inspect and modify data memory, load code memory, and reset the CPU — all via AXI4-Lite mapped registers.
 
+## Progress Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| **1.1 UART Library (uart_phy)** | ✅ Complete | Extracted from echo_char, sim & hardware verified (266/266 tests); `tx_ready` output added in bring-up (§A.9) |
+| **1.2 char_add_one** | ✅ Complete | Reusable test module, sim verified |
+| **1.3 echo_char rebuild** | ✅ Complete | Uses uart_phy + char_add_one, hardware verified |
+| **2.1 bf1 core adapt** | ✅ Complete | Added io_rd, pc_debug, cpu_active, ctrl_reset_i ports |
+| **2.2 bf1_soc wrapper** | ✅ Complete | Dual-port BRAMs, IO bridge, register decoder; 6/6 unit + 8/8 integration sim tests (§A.9) |
+| **3 Block Design** | ✅ Complete | system_bd.tcl updated, bitstream builds. Timing: WNS = +2.38 ns (see §A.8) |
+| **4 bf1ctl tool** | ❌ Not started | See §4.2 for design (HW tests so far used devmem/python scripts instead) |
+| **5 Hardware test** | ✅ Complete | Boot-image deployment; 7/7 tests ×3 runs — see §5.5 and doc/BF1_HW_TEST_FAILURE_HYPOTHESIS.md |
+
 ## Architecture
 
 ### End state
@@ -156,6 +169,7 @@ graph LR
 | `tx_data` | in | 8 | Byte to transmit |
 | `tx_start` | in | 1 | Single-cycle strobe to start transmission |
 | `tx_busy` | out | 1 | High while transmitting (backpressure) |
+| `tx_ready` | out | 1 | ≡ `!tx_busy` (added in bring-up for bf1_soc's ready-when-high `io_tx_ready`, §A.9) |
 
 Parameters: `CLK_FREQ = 100_000_000`, `BAUD = 115200`, `FIFO_DEPTH = 16`.
 
@@ -316,10 +330,10 @@ graph TB
 | `resetq` | in | 1 | CPU reset (active low, async) |
 | `io_rx_data` | in | 8 | Byte from UART RX (for `,`) |
 | `io_rx_valid` | in | 1 | `io_rx_data` is valid (sticky — holds until accepted) |
-| `io_rx_ready` | out | 1 | CPU is executing `,` — drives `uart_phy.rx_accept_i` (backpressure) |
+| `io_rx_ready` | out | 1 | Drives `uart_phy.rx_accept_i`: `io_rd && !halted && (!io_rx_valid \|\| cpu_active)` (§A.9) |
 | `io_tx_data` | out | 8 | Byte for UART TX (from `.`) |
 | `io_tx_valid` | out | 1 | Strobe: `io_tx_data` is valid |
-| `io_tx_ready` | in | 1 | UART TX can accept (≡ `!tx_busy`) |
+| `io_tx_ready` | in | 1 | UART TX can accept — connect to `uart_phy.tx_ready` (≡ `!tx_busy`) |
 | `debug_pc` | out | 13 | Current program counter |
 | `debug_rsp` | out | 4 | Current return stack pointer |
 | `ctrl_gp0_out` | in | 32 | `up_gp_out_0` from axi_gpreg — control register |
@@ -332,32 +346,32 @@ graph TB
 **Internal design:**
 
 **Clock gate and IO stall:** A register-based clock enable — no BUFGCE needed.
-The bf1 core advances only when `cpu_active = !halted && !io_stall_rx && !io_stall_tx`.
-`io_stall_rx` is **combinational** — it must drop `cpu_active` in the same cycle
-the CPU asserts `io_rd`, otherwise the PC advances past the `,` instruction before
-the stall takes hold.
+The bf1 core advances only when `cpu_active = cpu_active_raw && !prefetch && bf1_ce`
+(`bf1_ce` toggles every cycle — half-speed enable, see §A.8).
+Both IO stalls are **combinational** — they must drop `cpu_active` in the same
+cycle the CPU asserts `io_rd`/`io_wr`, otherwise the PC advances past the
+instruction before the stall takes hold.
 
 ```verilog
 reg halted;         // PS-commanded halt
 reg step_pending;   // single-step in progress
-reg io_stall_tx;    // registered one-shot for '.' backpressure
 
-// Combinational stall: blocks PC advance in the SAME cycle io_rd goes high
+// Combinational stalls: block PC advance in the SAME cycle io_rd/io_wr go high
 wire io_stall_rx = io_rd && !io_rx_valid;
+wire io_stall_tx = io_wr && !io_tx_ready;
 
-// Registered stall for TX: '.' fires for one cycle, so we need memory
-// to hold the stall across cycles until tx_ready asserts.
-always @(posedge clk_i or negedge resetq) begin
-    if (!resetq) begin
-        io_stall_tx <= 0;
-    end else if (io_wr && cpu_active && !io_tx_ready) begin
-        io_stall_tx <= 1;
-    end else if (io_stall_tx && io_tx_ready) begin
-        io_stall_tx <= 0;
-    end
-end
+wire cpu_active_raw = !halted && !io_stall_rx && !io_stall_tx;
+wire cpu_active     = cpu_active_raw && !prefetch && bf1_ce;
+```
 
-wire cpu_active = !halted && !io_stall_rx && !io_stall_tx;
+**Why combinational for BOTH stalls (lesson from HW bring-up, §A.9):**
+an earlier revision used a *registered* one-shot for `io_stall_tx`, which
+engaged one cycle AFTER the `.` execute edge — the `io_tx_valid` strobe had
+already fired into a busy uart_phy (ignored) and the PC had already advanced,
+silently dropping any `.` that executes while TX is busy (back-to-back
+output, e.g. `+..`). A registered `io_stall_rx` has the same one-cycle-late
+problem for input. With combinational stalls the strobe can only fire into
+an idle uart_phy, and `,` cannot be skipped.
 
 ```verilog
 reg halted;         // PS-commanded halt
@@ -393,11 +407,16 @@ Tracing a step:
   `step_pending && cpu_active` → `halted <= 1`, `step_pending <= 0`.
 - **Cycle N+2:** CPU halted again.
 
-bf1 has multi-cycle instructions (`[` takes 2 cycles, `]` takes 3). A single
-step advances one clock cycle, not necessarily one source-level instruction.
-This is acceptable for debugging; the PS can issue multiple steps to walk
-through a multi-cycle instruction, or an `instruction_done` detector can be
-added later.
+The bf1 ALU is purely combinational — every instruction (`>`, `<`, `+`, `-`, `,`, `.`, `[`, `]`) completes in a single `cpu_active` cycle. The ALU computes the next PC, memory address, and data in one clock period, and the sequential block captures all results on the rising edge. Therefore, each step command advances exactly one source-level Brainfuck instruction. No `instruction_done` detector is needed.
+
+**Step tracing (corrected):**
+- **Cycle N:** PS writes STEP → `halted <= 0`, `step_pending <= 1`.
+- **Cycle N+1:** `cpu_active = 1`. CPU executes one complete instruction.
+  Same cycle: `step_pending && cpu_active` → `halted <= 1`, `step_pending <= 0`.
+- **Cycle N+2:** CPU halted, exactly one instruction executed.
+
+An `instruction_done` signal (GP0_IN bit 1, see §2.3) is still provided for
+PS polling and performance counting, but the step mechanism does not depend on it.
 
 The bf1 sequential block is guarded by `cpu_active`:
 ```verilog
@@ -418,38 +437,65 @@ combinational. The bf1 registers do not update — the PC stays at the `,`
 instruction. When `io_rx_valid` asserts, `io_stall_rx` deasserts, `cpu_active`
 rises, and the CPU consumes the byte on the next posedge.
 
-`io_rx_ready` is driven by `io_rd && cpu_active` — it tells `uart_phy`'s
-`rx_accept_i` that the CPU is executing `,` **and** is not stalled.  When
-`io_rd = 0`, `rx_accept_i` stays low, the FIFO holds, and no data is
+`io_rx_ready` drives `uart_phy.rx_accept_i` and uses a **three-term gate**
+(final version, see §A.9 for the two failure modes it avoids):
+
+```verilog
+assign io_rx_ready = io_rd && !halted && (!io_rx_valid || cpu_active);
+```
+
+- `io_rd && !halted` — only accept while the CPU is at `,` and not halted
+  (byte held, not discarded, if the PS halts the CPU mid-instruction).
+- `!io_rx_valid` — while no byte is presented yet, keep `rx_accept_i` high
+  so uart_phy's holding register CAN present (its `rx_valid` only asserts
+  while `rx_accept_i=1`); without this term the handshake deadlocks.
+- `cpu_active` — once a byte IS presented, assert accept only at the
+  posedge where the CPU actually captures `io_din` (every other cycle due
+  to `bf1_ce`); without this term uart_phy consumes the byte on a
+  `bf1_ce=0` cycle and the CPU never sees it.
+
+When `io_rd = 0`, `rx_accept_i` stays low, the FIFO holds, and no data is
 popped until bf1 reaches the next `,` instruction.  (The uart_phy
 FIFO buffers up to 16 bytes between `,` instructions; beyond that,
 incoming bytes are dropped.)
 
 **IO stall (output — `.`):** When bf1 executes `.` (`io_wr`) but the TX path
-is busy (`io_tx_ready = 0`), a registered one-shot holds the stall until
-`io_tx_ready` asserts. Registered (not combinational) because `io_wr` is a
-single-cycle strobe — a combinational stall would clear as soon as `io_wr`
-goes low, releasing the stall before TX completes. At 115200 baud (~87 µs/byte)
-vs 100 MHz (10 ns/cycle), TX stalls are extremely rare in practice.
+is busy (`io_tx_ready = 0`), the combinational `io_stall_tx` freezes the PC
+at the `.` instruction. When `io_tx_ready` asserts (uart_phy idle), the CPU
+executes `.` at the next `cpu_active` edge and the single-cycle `io_tx_valid`
+strobe fires into an idle uart_phy. The strobe can therefore never be lost —
+back-to-back `.` instructions (e.g. `+..`) transmit correctly, spaced by the
+TX byte time. (An earlier registered one-shot version engaged one cycle too
+late and dropped such bytes — see §A.9.)
 
 **IO Bridge:**
 - **Input path (`io_din`):** Straight wire `assign io_din = io_rx_data`. The
   combinational `io_stall_rx` ensures `io_rx_data` is valid in the same cycle
   bf1 samples it.
-- **Output path:** A registered one-shot captures `io_dout` on the cycle
-  `io_wr && cpu_active`, drives `io_tx_data`/`io_tx_valid` as a single-cycle
-  strobe, then clears on the next cycle (when `io_tx_ready` is high).
-  `io_rx_ready` is gated by `cpu_active`: `assign io_rx_ready = io_rd && cpu_active`.
-  This prevents the UART sender from accepting data while the CPU is stalled.
+- **Output path:** On the cycle `io_wr && cpu_active` (guaranteed to be a
+  cycle where uart_phy is idle, thanks to combinational `io_stall_tx`),
+  `io_dout` is captured and `io_tx_valid` pulses for exactly one cycle —
+  a strobe, like echo_char's `tx_start`. A level-based `io_tx_valid` that
+  persists until `io_tx_ready` must NOT be used: it re-arms uart_phy's
+  `tx_start` when the previous transmission completes, sending every byte
+  twice.
+- **RX accept:** `assign io_rx_ready = io_rd && !halted && (!io_rx_valid || cpu_active)`
+  (see the three-term gate above).
 
 **Dual-port BRAMs:** Use `(* ram_style = "block" *)` inferred BRAM.
 
-**Code RAM** — port A **must be combinational** (`assign insn = code_ram[debug_pc]`).
-bf1 was designed for zero-latency instruction fetch (the original C++ testbench
-provides `insn` combinationally from `code_addr`). A registered BRAM output adds
-1 cycle of pipeline delay: the first instruction is skipped and jump targets
-execute one cycle late. At 100 MHz on Xilinx 7-series, the combinational
-BRAM → ALU → control path comfortably meets timing (~6–7 ns against a 10 ns period).
+**Code RAM** — port A uses registered BRAM output (`code_ra_dout`). bf1 was
+originally designed for zero-latency instruction fetch (`assign insn = code_ram[code_addr]`),
+but a registered BRAM output is required for functional timing. The `prefetch +
+code_addr = pcN` scheme described in §A.2 adapts the CPU to this 1-cycle
+pipeline delay without losing or double-executing instructions.
+
+**Timing note:** The combinational path from BRAM output register through the
+ALU (decode muxes + CARRY4 adder + jump/pointer logic) to the bf1 core registers
+is ~11.5 ns on 7-series — which does NOT meet the 10 ns clock period at 100 MHz.
+The original estimate of ~6–7 ns only accounted for the adder itself, missing
+BRAM Tco, instruction decode muxes, and jump-target logic. See §A.8 for the
+selected timing closure solution.
 
 **Data RAM** — port A is read-first combinational (`assign mem_din = data_ram[mem_addr]`)
 with a registered write gated by both `mem_wr` **and** `cpu_active`:
@@ -514,13 +560,14 @@ returning the previous read result instead of the current one.
 
 | File | Action |
 |------|--------|
-| `hdl/library/bf1_soc/bf1.v` | Copy from brainfuck_machine + add `io_rd` |
+| `hdl/library/bf1_soc/bf1.v` | Copy from brainfuck_machine + add `io_rd`, `cpu_active`, `ctrl_reset_i` ports |
 | `hdl/library/bf1_soc/stack.v` | Copy from brainfuck_machine |
 | `hdl/library/bf1_soc/common.h` | Copy from brainfuck_machine |
 | `hdl/library/bf1_soc/bf1_soc.v` | Create — top-level wrapper |
 | `hdl/library/bf1_soc/bf1_soc_ip.tcl` | Create |
-| `hdl/library/bf1_soc/Makefile` | Create (with Verilator sim targets) |
-| `hdl/library/bf1_soc/tb_bf1_soc.cpp` | Create — Verilator C++ testbench |
+| `hdl/library/bf1_soc/Makefile` | Create (xsim sim targets: `sim`, `sim-uart`) |
+| `hdl/library/bf1_soc/tb_bf1_soc.sv` | Create — unit testbench (drives io_rx/io_tx directly) |
+| `hdl/library/bf1_soc/tb_bf1_soc_uart.sv` | Create — integration TB: bf1_soc + uart_phy, real serial (§A.9) |
 
 ### 2.3 Register map (axi_gpreg wiring)
 
@@ -533,7 +580,7 @@ Control bits (write-only; PS sets a bit to issue a command, then clears it):
 | Bits | Field | Access | Description |
 |------|-------|--------|-------------|
 | `[0]` | HALT | PS write | 0→1 edge = halt CPU |
-| `[1]` | RESET | PS write | 0→1 edge = assert resetq (CPU held in reset) |
+| `[1]` | RESET | PS write | 0→1 edge = reset CPU core registers (PC, RSP, maddr, lj, lj_offset via `ctrl_reset_i`), set HALTED, re-arm prefetch |
 | `[2]` | STEP | PS write | 0→1 edge = execute 1 instruction, then re-halt |
 | `[3]` | RUN | PS write | 0→1 edge = resume execution (clear halt) |
 | `[31:4]` | — | — | Reserved |
@@ -543,6 +590,7 @@ Status bits (read-only):
 | Bits | Field | Access | Description |
 |------|-------|--------|-------------|
 | `[0]` | HALTED | PL→PS read | 1 = CPU is halted |
+| `[1]` | INSTR_DONE | PL→PS read | Strobe: pulses high for 1 cycle per executed instruction (useful for performance counting and polling) |
 | `[15:3]` | PC | PL→PS read | Program counter (13 bits) |
 | `[19:16]` | RSP | PL→PS read | Return stack pointer (4 bits) |
 | `[31:20]` | — | — | Reserved |
@@ -605,7 +653,14 @@ transitions on HALT, RESET, STEP, and RUN.
 
 ## Phase 3: Block Design Integration
 
+**Status:** ✅ Complete
+
 **Goal:** Wire `uart_phy`, `bf1_soc`, and `axi_gpreg` into the existing Vivado block design. Replace the `echo_char_0` loopback with the bf1 system. `char_add_one` is available as a test module but is not in the final data path.
+
+Build produces a working bitstream (`system_top.bit`). Timing is closed
+on all clock domains (final bring-up build: fpga_0_clk WNS = +2.38 ns,
+0 violations) via multicycle path constraints in `bf1_timing.xdc`.
+See §A.8 for details.
 
 ### 3.1 Block design changes
 
@@ -644,7 +699,11 @@ ad_connect bf1_soc_0/io_rx_ready  uart_phy_0/rx_accept_i
 # ── bf1_soc TX → uart_phy (direct, no char_add_one) ──
 ad_connect bf1_soc_0/io_tx_data   uart_phy_0/tx_data
 ad_connect bf1_soc_0/io_tx_valid  uart_phy_0/tx_start
-ad_connect uart_phy_0/tx_busy     bf1_soc_0/io_tx_ready
+# io_tx_ready is ready-when-high — connect tx_ready (= !tx_busy), NOT tx_busy.
+# (tx_busy was connected originally and silently inverted the stall logic,
+#  masked only because the old registered io_stall_tx never blocked the
+#  strobe — see §A.9.)
+ad_connect uart_phy_0/tx_ready    bf1_soc_0/io_tx_ready
 
 # ── bf1 control via axi_gpreg ──
 ad_ip_instance axi_gpreg bf1_ctrl
@@ -835,18 +894,16 @@ sequenceDiagram
     Note over User,TTY: Load and run "echo" BF program: ,[.,]
 
     User->>bf1ctl: bf1ctl reset
-    bf1ctl->>PL: assert resetq
-    bf1ctl->>PL: deassert resetq, CPU starts halted
+    bf1ctl->>PL: pulse GP0.1 (RESET) — PC/RSP/maddr<=0, halted=1, prefetch re-armed
 
     User->>bf1ctl: bf1ctl load echo.b
     bf1ctl->>PL: write bytes to code RAM via GP2
 
-    User->>bf1ctl: bf1ctl peek 0
-    bf1ctl->>PL: read data RAM[0] via GP1
-    PL-->>bf1ctl: 0x00 (empty tape)
+    User->>bf1ctl: bf1ctl poke 0 0
+    bf1ctl->>PL: write data RAM[0] via GP1 (BRAM is uninitialised after PL config)
 
     User->>bf1ctl: bf1ctl run
-    bf1ctl->>PL: clear HALT bit
+    bf1ctl->>PL: pulse GP0.3 (RUN) — halted=0
 
     Note over PL: CPU executes ',' — stalls waiting for input
 
@@ -858,7 +915,7 @@ sequenceDiagram
     TTY-->>User: cat /dev/ttyUL1 → "A"
 
     User->>bf1ctl: bf1ctl halt
-    bf1ctl->>PL: set HALT bit
+    bf1ctl->>PL: pulse GP0.0 (HALT) — halted=1
 
     User->>bf1ctl: bf1ctl status
     bf1ctl->>PL: read GP0_IN
@@ -898,7 +955,9 @@ make -C hdl/library/echo_char sim
 
 **Note:** Originally planned for Verilator, but xsim was used because
 Verilator was not installed and could not be added without `sudo`.
-Test the `bf1_soc` wrapper via the Vivado simulator:
+
+**Unit testbench** (`tb_bf1_soc.sv`, `make -C hdl/library/bf1_soc sim`) —
+drives `io_rx_data`/`io_rx_valid` directly and hardwires `io_tx_ready=1`:
 
 1. Load a known BF program (bf1 bytecode, NOT ASCII — see §A.1) into
    code RAM via the GP2 control interface
@@ -908,23 +967,49 @@ Test the `bf1_soc` wrapper via the Vivado simulator:
 5. Test memory peek/poke via GP1 while halted
 6. Run echo loop programs to verify `,`/`.` and `[`/`]` integration
 
-```bash
-make -C hdl/library/bf1_soc sim
-```
+**Integration testbench** (`tb_bf1_soc_uart.sv`,
+`make -C hdl/library/bf1_soc sim-uart`) — `bf1_soc` + `uart_phy` wired
+exactly as `system_bd.tcl`, real 115200-baud serial frames into
+`uart_rx_i`, serial monitor on `uart_tx_o`:
+
+1. `,.` echo over the serial link, incl. no-spurious-TX-while-stalled check
+2. `,[.,]` echo loop with phase-varying byte arrivals (hits both `bf1_ce`
+   phases — catches the §A.9 RX byte-drop race)
+3. `+..` back-to-back output (catches the §A.9 TX-busy drop)
+
+The unit TB alone is NOT sufficient: it bypasses uart_phy's
+holding-register handshake and the TX-busy path — exactly where all three
+hardware bring-up bugs lived (§A.9).
 
 ### 5.5 Hardware test
 
-1. Build bitstream with the updated block design
-2. Load onto EBAZ4205
-3. Verify `/dev/ttyUL1` still appears
-4. Run `bf1ctl status` — confirm registers are accessible
-5. `bf1ctl load tests/echo.b` (`, [ . , ]` program)
-6. `bf1ctl run`
-7. `echo -n "A" > /dev/ttyUL1` → `cat /dev/ttyUL1` shows `A`
-8. `bf1ctl halt` → `bf1ctl status` shows halted state
-9. `bf1ctl peek 0` → shows `0x41` (value stored in tape cell 0)
-10. Verify bf1 I/O loopback: `echo -n "X" > /dev/ttyUL1` → `cat /dev/ttyUL1` shows `X`
-11. Run full character sweep via pyserial (like the echo_char test)
+**Deployment: boot image, not runtime `fpgautil`.** After a runtime PL
+reconfig the uartlite driver cannot re-bind (stale IRQ mapping:
+`error -ENXIO: IRQ index 0 not found`). Booting the new design from the
+start works cleanly: `make sdimg`, copy `BOOT.bin` +
+`system_top.bit.bin` to the SD boot partition (`/mnt` on the board),
+reboot. FSBL configures the PL, `S20fpgaregion` applies the overlay,
+the uartlite driver probes with valid IRQ — `/dev/ttyUL1` ready.
+
+**Result (test_bf1_v4.py — devmem + /dev/ttyUL1, no bf1ctl needed yet):
+7/7 PASS, three consecutive runs:**
+
+| Test | Program (bytecode) | Result |
+|------|--------------------|--------|
+| Increment-and-loop | `+.[]` (41 E0 82 80) | data_ram[0]==1 |
+| UART echo ×3 | `,.` (C0 E0) | 'A','B','C' echoed (was the failing case) |
+| Increment echo | `,+.` (C0 41 E0) | 0x42→0x43 |
+| Back-to-back output | `+..` (41 E0 E0) | two bytes 0x01,0x01 (TX-busy stall) |
+| Echo loop, varied timing | `,[.,]` (C0 84 E0 C0 80) | "Hello" echoed, both bf1_ce phases |
+
+Notes:
+- Programs must be **bf1 bytecode** (§A.1), loaded via GP2 writes.
+- Between programs: HALT (GP0.0) + RESET (GP0.1) — RESET is required,
+  otherwise the CPU resumes from its stale PC (H2 in the hypothesis doc).
+- Zero `data_ram[0]` via GP1 before `+`-based tests — BRAM content is
+  uninitialised after boot-time PL configuration.
+- Remaining for full parity with the original plan: bf1ctl tool (§4.2)
+  to replace ad-hoc devmem scripts.
 
 ---
 
@@ -947,14 +1032,16 @@ make -C hdl/library/bf1_soc sim
 | `hdl/library/bf1_soc/bf1_soc.v` | 2.2 | Create |
 | `hdl/library/bf1_soc/bf1_soc_ip.tcl` | 2.2 | Create |
 | `hdl/library/bf1_soc/Makefile` | 2.2 | Create |
-| `hdl/library/bf1_soc/tb_bf1_soc.sv` | 2.2 | Create (xsim SystemVerilog TB) |
+| `hdl/library/bf1_soc/tb_bf1_soc.sv` | 2.2 | Create (xsim SystemVerilog unit TB) |
+| `hdl/library/bf1_soc/tb_bf1_soc_uart.sv` | A.9 | Create (xsim integration TB — bf1_soc + uart_phy, real serial) |
 | `hdl/projects/ebaz4205/system_bd.tcl` | 3.1 | Edit — add bf1 system |
 | `hdl/projects/ebaz4205/Makefile` | 3.3 | Edit — add LIB_DEPS |
+| `hdl/projects/ebaz4205/bf1_timing.xdc` | A.8 | Create — multicycle path constraints (pin-based, closes timing at +2.624 ns) |
 | `u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso` | 4.1 | Edit — add bf1_ctrl node |
 | `tools/bf1ctl/bf1ctl.c` | 4.2 | Create |
 | `tools/bf1ctl/Makefile` | 4.2 | Create |
 
-**Total: 15 new files, 5 edits**
+**Total: 17 new files, 5 edits**
 
 ---
 
@@ -1096,41 +1183,268 @@ end
 This matches the testbench flow: set RD=1 → wait for DONE → read RDATA.
 
 
-## §A.8 Open Point — Timing Closure (bf1 ALU at 100 MHz)
+## §A.8 Timing Closure — Selected Approach
 
-**Status**: Synthesis and implementation pass, but `fpga_0_clk` (100 MHz) has WNS = –2.37 ns, 302 failing endpoints. All other clock domains meet timing with large margin.
+**Initial status (first build, Jul 20):** `fpga_0_clk` (100 MHz) had
+WNS = –2.37 ns, TNS = –377 ns, 302 failing endpoints (setup).
+
+**Status after fix (Jul 21, `bf1_timing.xdc`):** WNS = **+2.624 ns**,
+TNS = 0 ns, **0 failing endpoints** (both setup and hold). Bitstream
+built successfully; `adi_project_run` passed timing check.
 
 ### Root Cause
 
-The bf1 core uses a purely combinational ALU.  The critical path is:
+The bf1 core uses a single-cycle combinational ALU. The critical path:
 
 ```
-code_ram Port B output (BRAM) → ALU (LUTs + CARRY4 chains, ~11 levels) → data_ram Port B address
+code_ram BRAM output register (Tco) → instruction decode muxes →
+CARRY4 adder (~8 levels) → jump/stack/pointer muxing →
+data_ram BRAM address/DI/WE pins or core register D input
 ```
 
-Total data-path delay: ~11.5 ns on a 10 ns clock period.  The ALU computes `maddrN`, `pcN`, `mem_din` bypass, and jump logic in a single combinational cloud.
+Total data-path delay: ~11.5 ns on a 10 ns clock period. The original
+estimate of ~6–7 ns was optimistic because it only accounted for the
+adder, not:
+- BRAM clock-to-output delay (Tco ≈ 1.2 ns on 7-series)
+- Instruction decode and sign-extension muxes before the adder (~3 ns)
+- Post-adder jump-target and pointer muxing (~3 ns)
+- Routing delay to/from CARRY4 chains
 
-### What We Tried
+### Selected Approach: Multicycle Path Constraints
 
-- **Half-speed clock enable** (`bf1_ce` toggle, gates `cpu_active` every other cycle):  correctly gates all bf1 register updates and BRAM Port A reads, giving the ALU an effective 20 ns.  But Vivado still sees the 10 ns clock period and reports violations on paths that are safely 2-cycle.
+**File:** `hdl/projects/ebaz4205/bf1_timing.xdc`
 
-### Options To Fix
+Rather than modifying RTL, we tell Vivado's static timing analyzer that
+all paths from BRAM output registers or bf1_inst flip-flop clock pins to
+core-internal endpoints have **2 clock periods** (20 ns) to settle. This
+matches the hardware reality: `bf1_ce` gates all core register updates
+to every other cycle, giving the ALU a full 20 ns between captures.
 
-1. **Multicycle path constraint (XDC)**
-   - `set_multicycle_path -setup 2` on paths from `bf1_soc` BRAM outputs through the ALU to `bf1_soc` BRAM/register inputs.
-   - Matches the 2-cycle effective rate from the clock enable.
-   - Requires careful scoping to not over-constrain PS-PortB paths.
+#### Pin-Based Patterns (Key Insight)
 
-2. **Second PS7 clock (FCLK_CLK1 at 50 MHz)**
-   - Clock `bf1_soc` from FCLK_CLK1 instead of FCLK_CLK0.
-   - Adds clock-domain crossing for UART and control-register signals.
-   - Cleaner separation, but more wiring (block design + synchronizers).
+Initial attempts used `get_cells` which failed because `bf1_soc` is an
+out-of-context (OOC) synthesized IP — at synthesis time the cells are
+black boxes, and `set_multicycle_path` with empty `-from`/`-to` lists
+is cached and reused at implementation.
 
-3. **Relax timing check in build system**
-   - Change ADI build script to allow `system_top.xsa` even with timing violations (already produces working bitstream).
-   - Pragmatic for a prototype; not suitable for production.
+The solution uses **pin patterns via `get_pins -filter {NAME =~ ...}`**
+which work at both synthesis and implementation time because they match
+on hierarchical name strings that are preserved across OOC boundaries:
 
-4. **Pipeline the ALU (modify bf1.v)**
-   - Insert a register stage inside the ALU to break the ~11-level logic.
-   - Adds 1-cycle latency to ALU ops; requires careful verification of `[`/`]` jump timing.
-   - Most intrusive but fixes the root cause.
+```tcl
+# Start points: BRAM clock pins + bf1_inst register clock pins
+set bf1_start_pins [concat \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/*ram_reg*/CLK*CLK && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*_reg*/C && DIRECTION == IN}]]
+
+# End points: bf1_inst reg D, BRAM ADDR/DI/WE, dist RAM ADR/I/DI/WE
+set bf1_end_pins [concat \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*_reg*/D && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/*ram_reg*/ADDR* && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/*ram_reg*/DI* && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/*ram_reg*/WE* && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*/*ADR* && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*/*/I && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*/*/DI* && DIRECTION == IN}] \
+    [get_pins -hier -filter {NAME =~ *bf1_soc_0/inst/bf1_inst/*/*/WE && DIRECTION == IN}]]
+
+set_multicycle_path -setup 2 -quiet -from $bf1_start_pins -to $bf1_end_pins
+set_multicycle_path -hold 1 -quiet -from $bf1_start_pins -to $bf1_end_pins
+```
+
+**Start points (58 total):**
+- 20 BRAM clock pins (CLKARDCLK + CLKBWRCLK on 10 RAMB36E1 cells)
+- 38 bf1_inst flip-flop clock pins (pc_reg, maddr_reg, rsp_reg, lj_reg,
+  lj_offset_reg)
+
+**End points (~1536 total):**
+- bf1_inst register D pins (38 flip-flops)
+- BRAM address/data/WE input pins (both Port A and Port B)
+- Distributed RAM input pins under rstack (RAMD32/RAMS32 primitives)
+
+**Excluded from MCP:** PS-facing control registers (ctrl_gp*_in/out,
+io_tx_data, etc.) which have short paths and run at full 1-cycle speed.
+
+#### Relationship to Library-Level XDC
+
+The bf1_soc IP core ships with its own constraint file,
+`hdl/library/bf1_soc/bf1_soc_constr.xdc`, which is included in the IP
+package via `bf1_soc_ip.tcl` and cached in the OOC synthesis DCP:
+
+```tcl
+set_multicycle_path -setup 2 \
+  -from [get_cells -hier -filter {IS_SEQUENTIAL}] \
+  -to   [get_cells -hier -filter {IS_SEQUENTIAL}]
+set_multicycle_path -hold 1 \
+  -from [get_cells -hier -filter {IS_SEQUENTIAL}] \
+  -to   [get_cells -hier -filter {IS_SEQUENTIAL}]
+```
+
+This is a **broader** version of the same idea — it constrains **every**
+sequential-to-sequential path within bf1_soc to 2 cycles, including
+PS-facing paths (ctrl_gp*_in, io_tx_data, etc.). Overconstraining those
+is harmless (they have ample margin), but the broad `get_cells` approach
+depends on the IP cache being fresh: if a stale OOC DCP without the
+constraint exists in `$ad_hdl_dir/ipcache`, it is silently reused and
+the constraint never takes effect.
+
+| File | Scope | Method | Granularity |
+|------|-------|--------|-------------|
+| `hdl/library/bf1_soc/bf1_soc_constr.xdc` | IP core (reusable) | `get_cells -filter {IS_SEQUENTIAL}` | Broad — all seq→seq paths |
+| `hdl/projects/ebaz4205/bf1_timing.xdc` | Project ebaz4205 | `get_pins -filter {NAME =~ ...}` | Targeted — CPU core only |
+
+The project-level XDC is the **verified fix** — it uses explicit pin
+patterns that work regardless of IP cache state, and only constrains
+the paths that actually need the 2-cycle slack. The library XDC is kept
+as a safety net for reuse in other projects.
+
+### Half-Speed Clock Enable (bf1_ce) — Already in RTL
+
+The `cpu_active` signal was already gated by a `bf1_ce` register that
+toggles every clock cycle — this was done during Phase 2.2 design as an
+architectural guarantee, before timing closure was attempted:
+
+```verilog
+reg bf1_ce;
+always @(posedge clk_i or negedge resetq) begin
+    if (!resetq)  bf1_ce <= 0;
+    else          bf1_ce <= !bf1_ce;
+end
+
+assign cpu_active = !halted && !io_stall_rx && !io_stall_tx && bf1_ce;
+```
+
+All bf1 core registers and BRAM Port A reads are gated by `cpu_active`.
+The MCP constraints tell the timing analyzer about this relationship.
+
+### ALU Pipeline Register (Fallback, Not Used)
+
+If the XDC constraints proved insufficient on a specific die/corner,
+the fallback was to add a pipeline stage inside `bf1.v`:
+
+```verilog
+reg [`DADDR_WIDTH-1:0] alu_c_reg;
+
+always @(posedge clk or negedge resetq) begin
+    if (!resetq)
+        alu_c_reg <= 0;
+    else if (cpu_active)
+        alu_c_reg <= alu_c;
+end
+
+// Replace alu_c with alu_c_reg in the "after ALU" block
+```
+
+Split the critical path:
+- **Path 1:** BRAM output → decode → adder → `alu_c_reg` (~6 ns)
+- **Path 2:** `alu_c_reg` → jump/pointer mux → core registers (~4 ns)
+
+**Not needed** — the XDC-only approach achieved clean timing on the
+first full re-implementation.
+
+### Timing Comparison
+
+| Approach | Setup WNS | Hold WHS | Fmax | CPI | Eff. IPS @ 100 MHz |
+|----------|-----------|----------|------|-----|-------------------|
+| No mitigation | –2.37 ns | +0.024 ns | ~74 MHz | 1 | 74 M |
+| **+ Multicycle XDC (selected)** | **+2.624 ns** | **+0.031 ns** | **100 MHz** | **2** | **50 M** |
+| + ALU pipeline register (fallback) | ≥ 0 ns | — | 100 MHz | 2 | 50 M |
+
+All approaches that meet timing yield 50 M instructions/sec at
+100 MHz, ~4300× faster than the 115200 baud UART can feed data.
+The system bottleneck is I/O throughput, not CPU speed.
+
+---
+
+## Appendix A.9: UART RX/TX handshake — bugs found in HW bring-up
+
+Full blow-by-blow in `doc/BF1_HW_TEST_FAILURE_HYPOTHESIS.md`. Three bugs
+lived in the bf1_soc ↔ uart_phy handshake; all were invisible to the unit
+testbench (which drives `io_rx_valid` directly and hardwires `io_tx_ready=1`)
+and were caught by a new integration testbench + hardware tests.
+
+### uart_phy's holding-register semantics (the trap)
+
+`uart_phy`'s RX output is a holding register, NOT a standard valid/ready
+stream:
+
+```verilog
+if (rx_valid && rx_accept_i) begin ... end              // consume + advance
+else if (!rx_valid && !fifo_empty && rx_accept_i) ...   // present (rx_valid<=1)
+```
+
+Two consequences that violate ordinary valid/ready intuition:
+1. **Presentation requires accept:** `rx_valid` only asserts while
+   `rx_accept_i = 1` (ready-before-valid).
+2. **Consumption is unconditional:** once presented, the byte is consumed at
+   ANY posedge where `rx_accept_i = 1` — whether or not the consumer
+captured it.
+
+This works fine with echo_char (`rx_accept_i = !tx_busy` ≈ always 1), which
+is why 266/266 hardware tests passed there. bf1_soc, however, gates accept
+with CPU state — and must satisfy both constraints below.
+
+### Bug 1 — deadlock vs. byte-drop: the io_rx_ready gate
+
+- `io_rx_ready = io_rd && cpu_active` (original): circular wait —
+  presentation waits for `rx_accept_i`, `rx_accept_i` waits for
+  `cpu_active`, `cpu_active` waits for `io_rx_valid`. CPU deadlocks at `,`.
+- `io_rx_ready = io_rd && !halted` (first fix): deadlock broken, but
+  consumption no longer aligned with the capture edge. `bf1_ce` toggles
+  every cycle; on a `bf1_ce=0` cycle `cpu_active=0` (CPU does not capture
+  `io_din`) yet `rx_accept_i=1` → uart_phy consumes the byte → byte lost,
+  CPU stuck at `,` (PC=0, halted=0) — ~50% per byte, phase-dependent.
+  **This was the deployed failure.**
+- **Final:** `io_rx_ready = io_rd && !halted && (!io_rx_valid || cpu_active)`
+  — presentation allowed while waiting (no deadlock), consumption only at
+  the true capture edge (no drop), held while halted (no discard).
+
+### Bug 2 — registered io_stall_tx drops back-to-back `.`
+
+The single-cycle `io_tx_valid` strobe fires at the `.` execute edge. The old
+registered `io_stall_tx` engaged one cycle LATER — so a `.` executing while
+uart_phy was still busy fired the strobe into a busy FSM (ignored), advanced
+the PC, and stalled pointlessly afterwards. Any two `.` within one byte-time
+(~8680 clk @ 115200 baud) → second byte silently lost (`+..`, Hello-World).
+**Fix:** combinational `io_stall_tx = io_wr && !io_tx_ready` — the CPU holds
+at `.` and the strobe can only fire into an idle uart_phy.
+
+### Bug 3 — inverted tx_busy → io_tx_ready in system_bd.tcl
+
+`io_tx_ready` is ready-when-high (`!io_tx_ready` = stall); `tx_busy` is
+busy-when-high. The block design connected `tx_busy` → `io_tx_ready` —
+inverted. Masked because the old registered `io_stall_tx` never actually
+blocked the strobe; would deadlock with Bug 2's fix. **Fix:** added a
+`tx_ready` output (= `!tx_busy`) to `uart_phy` and connected
+`uart_phy_0/tx_ready → bf1_soc_0/io_tx_ready`.
+
+### The missing test — integration testbench
+
+`hdl/library/bf1_soc/tb_bf1_soc_uart.sv` wires `bf1_soc` + `uart_phy`
+exactly as `system_bd.tcl` and drives real 115200-baud serial frames.
+Verified to catch every broken variant:
+
+| RTL variant | Integration TB result |
+|-------------|-----------------------|
+| `io_rx_ready = io_rd && cpu_active` | all echo tests timeout, PC=0 (deadlock) |
+| `io_rx_ready = io_rd && !halted` (deployed) | phase-dependent timeouts, PC=0 — exact HW symptom |
+| fixed RX + registered `io_stall_tx` | `+..` second byte dropped (timeout, PC=3) |
+| all fixes | **8/8 PASS** |
+
+Lesson: when a consumer/producer handshake is conditionally gated, a unit
+testbench that bypasses the partner module cannot validate the handshake —
+always keep an integration-level simulation of the exact block-design
+wiring.
+
+### Also from bring-up (H2/H3 in the hypothesis doc)
+
+- **`ctrl_reset_i` (bf1.v):** PS RESET (GP0 bit 1) now synchronously resets
+  the bf1 core registers (PC, RSP, maddr, lj, lj_offset) and re-arms
+  `prefetch`. Without it the CPU resumed from its stale PC after a program
+  reload — the root cause of the *original* hardware failure (PC=3).
+- **uart_phy synchroniser reset:** `uart_in_sync0/1` init to `1` on reset.
+  Defensive only — in practice the first RX baud tick (108 clk) comes long
+  after the synchroniser settles (2 clk), so no false start bit is possible.
+- **Boot-image deployment:** after runtime `fpgautil` reconfiguration the
+  uartlite driver cannot re-bind (stale IRQ mapping). Replace `BOOT.bin` +
+  `system_top.bit.bin` on the SD boot partition and reboot instead (§5.5).
