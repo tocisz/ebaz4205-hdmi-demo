@@ -107,6 +107,8 @@ bf1 <program.b|program.bin> [options]
 | `--no-clear-data-ram` | Skip ~1–2s full 32K data RAM clear |
 | `-q` / `--quiet` | Less status noise |
 
+Fast BF-based clear (nested riding counters, ~101B): see [`CLEAR_DATA_RAM.md`](CLEAR_DATA_RAM.md).
+
 ### `bf1.py` (host)
 
 ```

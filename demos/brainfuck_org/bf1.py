@@ -387,7 +387,10 @@ def add_board_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--no-clear-data-ram",
         action="store_true",
-        help="Skip 32K data RAM clear (faster, less deterministic)",
+        help=(
+            "Skip 32K data RAM clear (less deterministic; "
+            "clear is normally a fast on-CPU BF program)"
+        ),
     )
     p.add_argument(
         "--no-verify-load",

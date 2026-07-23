@@ -6,8 +6,8 @@ Intended for use *on the board* (e.g. installed as /root/bf1). Accepts either:
   - plain Brainfuck source (.b / .bf / …) — compiled on the fly via comp_bf.py
   - precompiled bf1 bytecode (.bin)
 
-Loads bytecode into code RAM, clears data RAM, starts the CPU, and puts the
-program's UART on your console.
+Loads bytecode into code RAM, clears data RAM (fast on-CPU BF program; see
+CLEAR_DATA_RAM.md), starts the CPU, and puts the program's UART on your console.
 
 Usage (on board):
   bf1 hello.b
@@ -75,6 +75,22 @@ DATA_RAM_SIZE = 32768  # 32K × 8
 UART_DEV = "/dev/ttyUL1"
 UART_BAUD = 115200
 
+# ---------------------------------------------------------------------------
+# Fast data-RAM clear (nested riding counters on the bf1 CPU)
+# 32768 = 128 × 256; 256 = 16 × 16; 16 = 4 × 4.  See CLEAR_DATA_RAM.md.
+# Host polls m[0] == 0xFF as the done flag, then zeros m[0] itself.
+# ---------------------------------------------------------------------------
+CLEAR_DATA_RAM_CODE = bytes((
+    0x83, 0x7F, 0x80, 0x5F, 0x5F, 0x5F, 0x5F, 0x44, 0xA0, 0x5B, 0x7F, 0x01,
+    0x83, 0x7F, 0x80, 0x50, 0xA0, 0x2B, 0x7F, 0x01, 0x83, 0x7F, 0x80, 0x44,
+    0x9B, 0x7F, 0x01, 0x83, 0x7F, 0x80, 0x01, 0x83, 0x7F, 0x80, 0x01, 0x83,
+    0x7F, 0x80, 0x01, 0x83, 0x7F, 0x80, 0x3C, 0x86, 0x7F, 0x04, 0x41, 0x3C,
+    0x80, 0x04, 0x80, 0x2F, 0x86, 0x7F, 0x10, 0x41, 0x30, 0x80, 0x10, 0x80,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x3F, 0x95, 0x7F, 0x1F,
+    0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x08, 0x41, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x80, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F,
+    0x1F, 0x1F, 0x08, 0x80, 0x7F, 0x82, 0x80,
+))
 
 # ===================================================================
 # Board control class
@@ -173,10 +189,38 @@ class Bf1Board:
         self._w(GP1_OUT, 0)
         return v
 
-    def clear_data_ram(self):
-        """Zero all 32K data-RAM cells for deterministic initial state."""
-        for i in range(DATA_RAM_SIZE):
-            self.data_write(i, 0)
+    def clear_data_ram(self, timeout: float = 2.0) -> float:
+        """Zero all 32K data-RAM cells via a short on-CPU Brainfuck program.
+
+        Far faster than poking each cell from the PS (tens of ms vs >1 s).
+        Loads ``CLEAR_DATA_RAM_CODE``, runs it, polls ``m[0] == 0xFF`` as the
+        done flag, halts, then writes ``m[0] = 0`` so the tape is all zeros.
+
+        Returns elapsed seconds. Raises ``RuntimeError`` on timeout.
+        """
+        t0 = time.monotonic()
+        self.halt()
+        # Avoid a false done if dirty RAM already had 0xFF at cell 0.
+        self.data_write(0, 0)
+        self.load_program(CLEAR_DATA_RAM_CODE)
+        self.reset()
+        self.run()
+
+        deadline = t0 + timeout
+        while self.data_read(0) != 0xFF:
+            if time.monotonic() >= deadline:
+                self.halt()
+                got = self.data_read(0)
+                raise RuntimeError(
+                    f"data RAM clear timed out after {timeout:.1f}s "
+                    f"(m[0]=0x{got:02X}, expected 0xFF)"
+                )
+            time.sleep(0.0005)
+
+        self.halt()
+        # Done flag left m[0]=0xFF — restore a fully clean tape for the user program.
+        self.data_write(0, 0)
+        return time.monotonic() - t0
 
     # -- CPU control ---------------------------------------------------
 
@@ -587,7 +631,10 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--no-clear-data-ram", action="store_true",
-        help="Skip zeroing all 32K data RAM (faster, less deterministic)",
+        help=(
+            "Skip zeroing all 32K data RAM before the program "
+            "(less deterministic; clear is normally a fast on-CPU BF program)"
+        ),
     )
     p.add_argument(
         "--no-verify-load", action="store_true",
@@ -667,13 +714,13 @@ def main():
         board.reset()
 
         if not args.no_clear_data_ram:
-            # clear_data_ram prints its own progress on stdout historically;
-            # keep that on stderr via a small local redirect.
-            _log("Clearing data RAM ...", quiet=quiet, end="", flush=True)
-            t_clear = time.monotonic()
-            for i in range(DATA_RAM_SIZE):
-                board.data_write(i, 0)
-            _log(f" done ({time.monotonic() - t_clear:.1f}s)", quiet=quiet)
+            _log("Clearing data RAM (on-CPU) ...", quiet=quiet, end="", flush=True)
+            try:
+                dt_clear = board.clear_data_ram()
+            except RuntimeError as e:
+                print(f"\nERROR: {e}", file=sys.stderr)
+                sys.exit(1)
+            _log(f" done ({dt_clear * 1000.0:.1f} ms)", quiet=quiet)
 
         _log("Loading program ...", quiet=quiet, end="", flush=True)
         board.load_program(code)
@@ -690,6 +737,10 @@ def main():
                         )
                 sys.exit(1)
         _log(" ok", quiet=quiet)
+
+        # Reset after load so PC/ptr/stack start clean. Required after the
+        # on-CPU clear program, which leaves PC in its trailing spin-loop.
+        board.reset()
 
         fd = setup_uart()
         drain_uart(fd)
