@@ -119,14 +119,14 @@ def calc_jmp(
     if tree.l >= 0:
         length = tree.r - tree.l + inserted + 1
         if length >= 0b00100000:
-            high = length >> 8
-            low = length & 0xFF
-            if high > 0b00111111:
+            low5 = length & 0x1F            # bits [4:0]  → prefix byte
+            high8 = (length >> 5) & 0xFF     # bits [12:5] → jump byte
+            if (length >> 13) != 0:
                 raise SyntaxError(
                     f"jump too long at {tree.l} (length = {length})"
                 )
-            out_bin[tree.l + offset] = 0b10100000 | high
-            out_bin.insert(tree.l + offset + 1, low)
+            out_bin[tree.l + offset] = 0b10100000 | low5
+            out_bin.insert(tree.l + offset + 1, high8)
             inserted += 1
             stats["long_jumps"] += 1
         else:

@@ -289,7 +289,7 @@ def run_bf1_bytecode(
         insn = code[pc]
 
         if lj:
-            offset = ((lj_offset & 0x1F) << 8) | insn
+            offset = (insn << 5) | (lj_offset & 0x1F)
             if tape[ptr] != 0:
                 rsp.append(pc + 1)
                 pc = pc + 1
