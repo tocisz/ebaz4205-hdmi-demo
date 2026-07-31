@@ -1,0 +1,2 @@
+# Compiled brainfuck bytecode (generated, kept next to source)
+src/*.bin
