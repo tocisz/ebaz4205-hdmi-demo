@@ -119,11 +119,16 @@ def calc_jmp(
     if tree.l >= 0:
         length = tree.r - tree.l + inserted + 1
         if length >= 0b00100000:
-            low5 = length & 0x1F            # bits [4:0]  → prefix byte
-            high8 = (length >> 5) & 0xFF     # bits [12:5] → jump byte
-            if (length >> 13) != 0:
+            # The stored offset is the distance from the prefix byte to the
+            # byte AFTER the matching ']'.  length (= r - l + inserted + 1)
+            # is one short of that because the inserted jump byte itself
+            # shifts the ']' forward, so encode length + 1.
+            enc = length + 1
+            low5 = enc & 0x1F               # bits [4:0]  → prefix byte
+            high8 = (enc >> 5) & 0xFF        # bits [12:5] → jump byte
+            if (enc >> 13) != 0:
                 raise SyntaxError(
-                    f"jump too long at {tree.l} (length = {length})"
+                    f"jump too long at {tree.l} (length = {enc})"
                 )
             out_bin[tree.l + offset] = 0b10100000 | low5
             out_bin.insert(tree.l + offset + 1, high8)
