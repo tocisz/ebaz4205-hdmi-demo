@@ -83,6 +83,7 @@ The HDMI expansion board plugs into the FPGA I/O headers and provides a standard
 | Ethernet | RGMII via EMIO | Standard kernel netdev |
 | NAND flash | SMCC controller | MTD subsystem |
 | UART | UART0 (EMIO header), UART1 (MIO 24-25 USB) | Serial console |
+| PL TTY (UART) | AXI UART Lite (0x7C430000) → `uart_phy` → `bf2_soc` (PL) | `/dev/ttyUL1` (uartlite) |
 
 > **Blinking LED**: The green expansion-board LED (`gpio_led_green`, GPIO0 pin 54 / EMIO bit 0, ball W13) blinks with the kernel's `heartbeat` trigger by default. It is the **only LED that blinks autonomously** — the kernel `gpio-leds` driver (with `CONFIG_LEDS_GPIO=y` and `CONFIG_LEDS_TRIGGER_HEARTBEAT=y`) picks up the `linux,default-trigger = "heartbeat"` from the device tree at boot. No HDL logic or userspace code is involved. The remaining LEDs (`gpio_led_red`, `gpio_led_aux_0/1/2` on GPIO 55-58) have `linux,default-state = "off"` and stay dark until explicitly controlled via `/sys/class/leds/`.
 
@@ -379,6 +380,35 @@ mwipcore0: mwipcore@0 {
 ```
 
 Key detail: `mwipcore@0` has **no `reg` property** — this was a deliberate design choice. The MathWorks driver normally expects a register bank for IP control, but this design uses the ADI AXI DMAC directly as a pure streaming engine. A kernel patch (by the project author) was applied to allow the `mathworks,mwipcore` driver to work with no memory-mapped registers, making the info and TLAST channels conditional on `reg` being present.
+
+### PL TTY character device (UART)
+
+Beyond the two PS UART consoles, the design exposes a third serial channel to
+Linux: `/dev/ttyUL1`, backed by a Xilinx **AXI UART Lite** core in the PL
+(0x7C430000, IRQ 57). Its serial `tx`/`rx` wires connect to the **`uart_phy`**
+PHY — the same module used by the `bf2_soc` softcore — so Linux drives the
+softcore's UART as if it were an external UART:
+
+```mermaid
+graph LR
+    ps["Linux /dev/ttyUL1<br/>uartlite driver"]
+    ul["AXI UART Lite<br/>0x7C430000 / IRQ 57<br/>16-byte TX/RX FIFOs"]
+    phy["uart_phy (PL)<br/>8N1, 115200"]
+    soc["bf2_soc (PL softcore)<br/>parallel interface"]
+    ps <== "AXI4-Lite" ==> ul
+    ul -- "tx / rx serial wires" --> phy
+    phy -- "rx_data / rx_valid / rx_accept_i<br/>tx_data / tx_start / tx_ready" --> soc
+```
+
+**Backpressure caveat:** the PS→PL (RX) direction has **no end-to-end flow
+control**. The uartlite driver blocks `write()` only when the AXI UART Lite's
+own 16-byte TX FIFO is full — i.e. only at the wire baud rate (115200 ≈
+11.5 KB/s). The wire carries no RTS/CTS (AXI UART Lite has no modem pins), and
+`uart_phy` silently drops bytes when its 16-entry RX FIFO overflows, which the
+PS cannot detect. A long PS→PL stream while `bf2_soc` is not executing `,`
+therefore loses bytes silently. See [doc/PL_TTY_DEVICE.md](PL_TTY_DEVICE.md)
+for the full implementation and [doc/UART_PHY.md](UART_PHY.md) for the
+parallel-interface contract.
 
 ### Kernel configuration highlights
 

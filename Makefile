@@ -92,11 +92,21 @@ linux/arch/arm/boot/uImage: TOOLCHAIN
 build/uImage: linux/arch/arm/boot/uImage | build
 	cp $< $@
 
+### Linux kernel modules ###
+
+# Build all loadable modules (=m) for the target kernel (currently: ipip, 8021q,
+# axis_fifo, uartlite). Also generates the top-level Module.symvers that module
+# postprocessing needs. Modules are installed into the rootfs by
+# buildroot/board/$(TARGET)/post-build.sh.
+.PHONY: linux-modules
+linux-modules: linux/arch/arm/boot/uImage
+	$(TOOLS_PATH) make -C linux -j $(NCORES) ARCH=arm CROSS_COMPILE=$(CROSS_COMPILE) modules KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=buildhost
+
 ### Buildroot ###
 
 .PHONY: buildroot/output/images/rootfs.ext4
 
-buildroot/output/images/rootfs.ext4:
+buildroot/output/images/rootfs.ext4: linux-modules buildroot/board/$(TARGET)/post-build.sh
 	@echo device-fw $(VERSION)> $(CURDIR)/buildroot/board/$(TARGET)/VERSIONS
 	@$(foreach dir,$(VSUBDIRS),echo $(dir) $(shell cd $(dir) && git describe --abbrev=4 --dirty --always --tags) >> $(CURDIR)/buildroot/board/$(TARGET)/VERSIONS;)
 	make -C buildroot ARCH=arm zynq_$(TARGET)_defconfig
@@ -113,7 +123,13 @@ build/rootfs.ext4: buildroot/output/images/rootfs.ext4 | build
 .PHONY: build/system_top.xsa
 
 build/system_top.xsa: | build
-	bash -c "source $(VIVADO_SETTINGS) && ADI_IGNORE_VERSION_CHECK=1 make -C hdl/projects/$(TARGET) && cp hdl/projects/$(TARGET)/$(TARGET).sdk/system_top.xsa $@"
+	bash -c "source $(VIVADO_SETTINGS) && ADI_IGNORE_VERSION_CHECK=1 make -C hdl/projects/$(TARGET); \
+	  if [ -f hdl/projects/$(TARGET)/$(TARGET).sdk/system_top.xsa ]; then \
+	    cp hdl/projects/$(TARGET)/$(TARGET).sdk/system_top.xsa $@; \
+	  else \
+	    echo 'WARNING: timing not met, using bad_timing .xsa'; \
+	    cp hdl/projects/$(TARGET)/$(TARGET).sdk/system_top_bad_timing.xsa $@; \
+	  fi"
 	unzip -l $@ | grep -q ps7_init || cp hdl/projects/$(TARGET)/$(TARGET).srcs/sources_1/bd/system/ip/system_sys_ps7_0/ps7_init* build/
 
 build/sdk/fsbl/Release/fsbl.elf build/system_top.bit: build/system_top.xsa
@@ -140,7 +156,7 @@ build/boot.bin: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devic
 
 SDIMGDIR = $(CURDIR)/build_sdimg
 
-sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb build/uboot-env.bin build/uImage build/pl-ebaz4205.dtbo build/system_top.bit.bin u-boot-xlnx/tools/mkimage
+sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb build/uboot-env.bin build/uImage build/pl-ebaz4205.dtbo build/system_top.bit.bin build/rootfs.ext4 u-boot-xlnx/tools/mkimage
 	rm -rf $(SDIMGDIR)
 	mkdir -p $(SDIMGDIR)
 	cp build/fsbl.elf       $(SDIMGDIR)/fsbl.elf
@@ -150,6 +166,7 @@ sdimg: build/fsbl.elf build/system_top.bit build/u-boot.elf build/devicetree.dtb
 	cp build/devicetree.dtb $(SDIMGDIR)/devicetree.dtb
 	cp build/pl-ebaz4205.dtbo $(SDIMGDIR)/pl-ebaz4205.dtbo
 	cp build/system_top.bit.bin $(SDIMGDIR)/system_top.bit.bin
+	cp build/rootfs.ext4    $(SDIMGDIR)/rootfs.ext4
 #	cp build/uboot-env.bin  $(SDIMGDIR)/uboot.env
 	u-boot-xlnx/tools/mkimage -A arm -T script -C none -n "Boot script" -d scripts/boot.cmd $(SDIMGDIR)/boot.scr
 	echo "img : {[bootloader] $(SDIMGDIR)/fsbl.elf $(SDIMGDIR)/system_top.bit $(SDIMGDIR)/u-boot.elf [load = 0x00100000] $(SDIMGDIR)/devicetree.dtb}" > $(SDIMGDIR)/boot.bif
