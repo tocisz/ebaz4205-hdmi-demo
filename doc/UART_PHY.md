@@ -64,12 +64,12 @@ Both ends implement the standard 8N1 frame, **LSB first**, **no parity**,
 **idle = high**:
 
 ```text
-     start       8 data bits (LSB first)        stop
-     ┌─────┬──┬──┬──┬──┬──┬──┬──┬──┬─────┐
-line │  0  │b0│b1│b2│b3│b4│b5│b6│b7│  1  │
-     └─────┴──┴──┴──┴──┴──┴──┴──┴──┴─────┘
-     ├─ 1 bit ─┤                            ├ 1 bit ┤
-     └──────────── 10 bit times = 1 byte ────────────┘
+     start       8 data bits (LSB first)  stop
+     ┌─────────┬──┬──┬──┬──┬──┬──┬──┬──┬───────┐
+line │  0      │b0│b1│b2│b3│b4│b5│b6│b7│  1    │
+     └─────────┴──┴──┴──┴──┴──┴──┴──┴──┴───────┘
+     ├─ 1 bit ─┤                       ├ 1 bit ┤
+     └────── 10 bit times = 1 byte ────────────┘
 ```
 
 - **RX** samples the line with **8× oversampling**; each bit is sampled near
