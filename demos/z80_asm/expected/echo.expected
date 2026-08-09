@@ -1,0 +1,3 @@
+Expected output from echo.bin:
+All bytes sent to the Z80 via the FIFO are echoed back.
+Send "ABC" → receive "ABC".
