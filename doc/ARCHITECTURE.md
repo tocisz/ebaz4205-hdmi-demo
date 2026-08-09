@@ -198,6 +198,109 @@ graph TB
     hdmibrd --> mon["Monitor 640x480 @ 60 Hz"]
 ```
 
+### Block design reference (from `system_bd.tcl`)
+
+All IP instances and their connections, as defined in the Vivado block design:
+
+```mermaid
+graph LR
+    PS7["sys_ps7<br/>Zynq PS7"] -->|FCLK_CLK0 100 MHz| RST["sys_rstgen<br/>Reset Sync"]
+    PS7 -->|FCLK_RESET0_N| RST
+    RST -->|sys_cpu_reset / sys_cpu_resetn| PL
+
+    PS7 -->|100 MHz| DMA["hdmi_sink_dma<br/>AXI DMAC"]
+    PS7 -->|100 MHz| GEN["hdmi_generator_0<br/>PLL + AXI-S→RGB"]
+    PS7 -->|100 MHz| B2["bf2_soc_0"]
+    PS7 -->|100 MHz| BRIDGE["axis_byte_bridge_0"]
+    PS7 -->|100 MHz| FIFO["axi_fifo_mm_s_0<br/>AXI-Stream FIFO"]
+
+    PS7 ==>|64b AXI-MM via HP0| DMA
+    PS7 -.->|AXI-Lite @ 0x7C420000| DMA
+    PS7 -.->|AXI-Lite @ 0x7C440000| CTRL["bf2_ctrl<br/>AXI gpreg"]
+    PS7 -.->|AXI-Lite @ 0x7C450000| FIFO
+
+    DMA ==>|64b AXI-Stream| GEN
+    GEN -->|pixel_clk 25 MHz<br/>pixel_x5_clk 126 MHz| HDMI["hdmi_0<br/>TMDS TX"]
+    GEN -->|24b RGB| HDMI
+
+    HDMI -->|TMDS clock| EXT["hdmi_clk"]
+    HDMI -->|TMDS data 0| D0["hdmi_d0"]
+    HDMI -->|TMDS data 1| D1["hdmi_d1"]
+    HDMI -->|TMDS data 2| D2["hdmi_d2"]
+
+    FIFO ==>|32b stream PS→PL| BRIDGE
+    BRIDGE ==>|32b stream PL→PS| FIFO
+    BRIDGE <==>|byte handshake<br/>rx_data/rx_valid/rx_accept<br/>tx_data/tx_valid/tx_ready| B2
+
+    CTRL -->|ctrl_gp_out 3b| B2
+    B2 -->|ctrl_gp_in 3b| CTRL
+
+    DMA -.->|irq ps-12| INT["sys_concat_intc"]
+    FIFO -.->|irq ps-14| INT
+    INT -.->|IRQ_F2P| PS7
+
+    PS7 -->|SPI0_SCLK_O| SCL["lcd_scl"]
+    PS7 -->|SPI0_MOSI_O| SDA["lcd_sda"]
+    PS7 -->|TTC0_WAVE0_OUT| BZ["ttc0_wave0_out<br/>buzzer"]
+    PS7 -->|UART_0| UART["UART_0"]
+    PS7 -->|MDIO / GMII| ETH["MDIO_PHY / GMII"]
+    PS7 -->|GPIO_I/O/T 13b| GIO["gpio_i/o/t"]
+
+    style PS7 fill:#e1f5fe
+    style DMA fill:#e8f5e9
+    style GEN fill:#e8f5e9
+    style HDMI fill:#e8f5e9
+    style FIFO fill:#f3e5f5
+    style BRIDGE fill:#f3e5f5
+    style B2 fill:#f3e5f5
+    style CTRL fill:#f3e5f5
+    style RST fill:#fff3e0
+    style INT fill:#fce4ec
+    style EXT,D0,D1,D2,SCL,SDA,BZ,UART,ETH,GIO fill:#eceff1
+```
+
+| Instance | IP Core | Address / IRQ | Role |
+|---|---|---|---|
+| `sys_ps7` | `processing_system7` | — | Zynq-7000 PS (ARM A9, DDR, peripherals, 100 MHz FCLK, reset, AXI HP0/GP0) |
+| `sys_rstgen` | `proc_sys_reset` | — | Synchronizes FCLK_RESET0_N → `sys_cpu_reset` / `sys_cpu_resetn` |
+| `sys_concat_intc` | `xlconcat` | 16→1 to IRQ_F2P | Interrupt combiner |
+| `hdmi_sink_dma` | `axi_dmac` | `0x7C420000` irq ps-12 | DMA: reads DDR via HP0, streams 64-bit to HDMI generator |
+| `hdmi_generator_0` | `hdmi_generator` | — | MMCM PLL (100→25/126 MHz) + AXI-Stream→RGB adapter |
+| `hdmi_0` | `hdmi` | — | TMDS 1.4b serializer → HDMI connector |
+| `bf2_soc_0` | `bf2_soc` | — | Brainfuck softcore CPU (byte-level I/O handshake) |
+| `bf2_ctrl` | `axi_gpreg` | `0x7C440000` | 3-bit control gpreg for bf2 run/step/reset |
+| `axi_fifo_mm_s_0` | `axi_fifo_mm_s` | `0x7C450000` irq ps-14 | Dual 32-bit AXI-Stream FIFO (PS↔PL) |
+| `axis_byte_bridge_0` | `axis_byte_bridge` | — | 32-bit stream ↔ 8-bit byte handshake |
+| `audio_sample_word_GND` | `xlconstant` | — | 16-bit zero tie-off for unused HDMI audio |
+
+### PL resource utilization
+
+Resource usage per IP instance after place & route on the **xc7z010clg400-1** (Artix-7, ~28K logic cells).
+Percentages are of the total available in the PL fabric.
+
+| Instance | LUTs | % LUT | FFs | % FF | BRAM36 | % BRAM | DSP | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **System total** | **2800** | **15.9%** | **3103** | **8.8%** | **13** | **21.7%** | **0** | also 1 MMCM (50%), 4 BUFG (13%), 40 IOB (40%) |
+| `axi_fifo_mm_s_0` | 746 | 4.2% | 667 | 1.9% | 2 | 3.3% | 0 | AXI-Stream FIFO — largest LUT consumer |
+| `axi_cpu_interconnect` | 543 | 3.1% | 676 | 1.9% | 0 | — | 0 | AXI interconnect + auto protocol converter |
+| `hdmi_sink_dma` | 429 | 2.4% | 565 | 1.6% | 1 | 1.7% | 0 | AXI DMAC — register map + transfer engine |
+| `hdmi_0` | 352 | 2.0% | 171 | 0.5% | 0 | — | 0 | TMDS 1.4b serializer (3 channels + packet assembler) |
+| `bf2_soc_0` | 315 | 1.8% | 396 | 1.1% | 10 | 16.7% | 0 | Brainfuck CPU — BRAM-heavy (10× RAMB36 for program/stack) |
+| `bf2_ctrl` | 216 | 1.2% | 539 | 1.5% | 0 | — | 0 | AXI gpreg — regfile-heavy control |
+| `hdmi_generator_0` | 168 | 1.0% | 39 | 0.1% | 0 | — | 0 | PLL + LUTRAM double-buffer adapter |
+| `sys_rstgen` | 16 | 0.1% | 31 | 0.1% | 0 | — | 0 | Reset synchronizer |
+| `sys_ps7` | 14 | 0.1% | 10 | 0.0% | 0 | — | 0 | PS7 wrapper logic (EMIO fanout, IOBUF) |
+| `axis_byte_bridge_0` | 2 | 0.0% | 9 | 0.0% | 0 | — | 0 | Stream ↔ byte handshake bridge |
+| `sys_concat_intc` | 0 | — | 0 | — | 0 | — | 0 | Interrupt concat (wiring only) |
+| `audio_sample_word_GND` | 0 | — | 0 | — | 0 | — | 0 | xlconstant tie-off (wiring only) |
+
+**Key takeaways:**
+- The design uses **~16% of available LUTs** and **~9% of FFs** — plenty of room for additional logic.
+- **BRAM is the tightest resource** at 22% used (14 of 60 tiles), mostly consumed by the brainfuck CPU (10 RAMB36 for its program/stack memory) and the AXI-Stream FIFO (2 RAMB36 + 2 RAMB18).
+- **No DSP slices** are used at all — the design has no multiply-heavy datapath.
+- **1 of 2 MMCMs** is consumed by the HDMI pixel clock generation.
+- The design uses **40 of 100 IOBs**, mostly for the HDMI TMDS differential pairs, SPI LCD, EMIO GPIO, Ethernet RGMII, and UART.
+
 ### Project files in `hdl/projects/ebaz4205/`
 
 | File | Size | Purpose |

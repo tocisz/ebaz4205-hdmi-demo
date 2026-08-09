@@ -17,8 +17,8 @@ up, and `write()` blocks instead of losing bytes.
 
 | Phase | PL consumer on bridge | bf2_soc path | Purpose |
 |---|---|---|---|
-| **Phase 1 (current)** | `case_toggle` (XOR 0x20) | **Kept** on uartlite | Validate fifo+bridge+simple-module chain on hardware without touching bf2 |
-| **Phase 2 (next)** | `bf2_soc` | Removed; uartlite IP dropped | Full replacement: bf2-soc → bridge → fifo → char device |
+| **Phase 1** (completed) | `case_toggle` (XOR 0x20) | **Kept** on uartlite | Validated fifo+bridge+simple-module chain on hardware without touching bf2 |
+| **Phase 2 (current)** | `bf2_soc` | Removed; uartlite/uart_phy/case_toggle dropped | Full replacement: bf2-soc → bridge → fifo → char device |
 
 **The adapter ships in two variants** — same IP, same driver, same DT, same
 addresses; only the adapter internals differ:
@@ -39,18 +39,19 @@ graph LR
     subgraph pl["PL Fabric"]
         fifo["axi_fifo_mm_s<br/>TX FIFO + RX FIFO<br/>store-forward, 32-bit"]
         adp["axis_byte_bridge v1<br/>(drop 24 bits: 1 byte/word,<br/>TREADY, TLAST)"]
-        tog["case_toggle<br/>(XOR 0x20, phase-1 test)<br/>io_rx_* / io_tx_*"]
-        bf2["bf2_soc (kept on uartlite<br/>path until phase 2)"]
+        bf2["bf2_soc<br/>io_rx_* / io_tx_*"]
+        ctrl["bf2_ctrl (axi_gpreg)<br/>@ 0x7C440000"]
         drv <== "AXI4-Lite + IRQ 58" ==> fifo
         fifo -- "M_AXIS (PS→PL)" --> adp
         adp -- "S_AXIS (PL→PS)" --> fifo
-        adp <--> tog
+        adp <== "byte-level<br/>io_rx_*/io_tx_*" ==> bf2
+        ctrl -- "ctrl_gp*" --> bf2
     end
 ```
 
-## Background — current path and its gap
+## Background — why the bridge replaced uartlite
 
-`hdl/projects/ebaz4205/system_bd.tcl` today wires:
+The original `bf2_soc` path used:
 
 ```
 PS /dev/ttyUL1 (uartlite) ──AXI4-Lite @0x7C430000, IRQ 57──▶ axi_uartlite_0
@@ -61,8 +62,11 @@ bf2_soc_0/io_tx_* ──parallel──▶ uart_phy_0 ──serial wire──▶ 
 Gap (documented in `UART_PHY.md` §7): when `bf2_soc` stops draining (compute-bound
 program with no `,`), `uart_phy`'s 16-byte RX FIFO fills in ~1.4 ms and incoming
 bytes are **dropped silently** — the PS cannot detect it because AXI UART Lite has
-no flow control and the wire carries no status. `cat bigfile > /dev/ttyUL1` runs at
-the wire rate and loses bytes with no error.
+no flow control and the wire carries no status.
+
+This path has been replaced by the AXI-Stream FIFO bridge (Phase 2).
+`axi_uartlite_0`, `uart_phy_0`, and the `case_toggle` test module no longer appear
+in the block design. The PS console stays on UART1 (`ttyPS0`, MIO 24-25).
 
 ## Solution architecture
 
@@ -105,10 +109,10 @@ adapter must, and `bf2_soc` does (`io_stall = ... io_wr_pending && (!io_tx_ready
 
 ## Design decisions
 
-1. **Replace** `axi_uartlite_0` + `uart_phy_0` in the `bf2_soc` path (both leave the
-   block design). The PS console stays on UART1 (`ttyPS0`, MIO 24-25) — `ttyUL1` is
-   not a console (`CONFIG_SERIAL_UARTLITE_CONSOLE` not set). `uart_phy` remains in
-   `hdl/library/` as a reusable IP (echo_char/bf1_soc sims still use it).
+1. **Replaced** `axi_uartlite_0` + `uart_phy_0` in the `bf2_soc` path — both are
+   removed from the block design. The PS console stays on UART1 (`ttyPS0`, MIO 24-25).
+   `uart_phy` remains in `hdl/library/` as a reusable IP (echo_char/bf1_soc sims
+   still use it).
 2. **Packet = one 32-bit word = one byte (v1).** `TLAST` per word on `S_AXIS`, and on
    `M_AXIS` the packet length (TLR) simply equals the byte count. Gives byte-stream
    semantics at the cost of 3 wasted bits per byte — the simplest correct adapter.
@@ -216,8 +220,8 @@ Deliverables: module + `Makefile` (ADI library style) + `tb_axis_byte_bridge.sv`
 
 ### 2. Block design — `hdl/projects/ebaz4205/system_bd.tcl`
 
-The existing bf2_soc/uartlite/uart_phy/bf2_ctrl wiring is **kept untouched**
-(bf2 stays functional).  The bridge path is added alongside:
+The original `bf2_soc`/`uartlite`/`uart_phy` path and the Phase-1 `case_toggle`
+test are removed. `bf2_soc` connects directly to the bridge. `bf2_ctrl` is kept.
 
 - Add `axi_fifo_mm_s` (`axi_fifo_mm_s_0`):
   - Data interface **AXI4-Lite** (store-forward), `C_USE_TX_DATA=1`,
@@ -232,13 +236,14 @@ The existing bf2_soc/uartlite/uart_phy/bf2_ctrl wiring is **kept untouched**
 - Add `axis_byte_bridge_0` (clk/reset on `sys_cpu_clk`/`sys_cpu_reset`):
   - `axi_fifo_mm_s_0/AXI_STR_TXD` → `axis_byte_bridge_0/m_axis`
   - `axis_byte_bridge_0/s_axis` → `axi_fifo_mm_s_0/AXI_STR_RXD`
-  - Bridge byte side → `case_toggle_0` (NOT `bf2_soc_0`; bf2 keeps uartlite).
-- Add `case_toggle_0` (clk/reset on `sys_cpu_clk`/`sys_cpu_reset`, active-high):
-  - Same io_* interface as bf2_soc: `io_rx_data`/`io_rx_valid`/`io_rx_ready` (level),
-    `io_tx_data`/`io_tx_valid` (strobe)/`io_tx_ready`.
-  - XOR 0x20 on each byte (uppercase ↔ lowercase).
-- Add `LIB_DEPS += axis_byte_bridge` and `LIB_DEPS += case_toggle` in
-  `hdl/projects/ebaz4205/Makefile` (ADI library-mk builds their `component.xml`).
+  - Bridge byte side → `bf2_soc_0`:
+    - `rx_data`/`rx_valid` → `io_rx_data`/`io_rx_valid`
+    - `io_rx_ready` → `rx_accept`
+    - `io_tx_data`/`io_tx_valid` → `tx_data`/`tx_valid`
+    - `tx_ready` → `io_tx_ready`
+- Add `LIB_DEPS += axis_byte_bridge` in `hdl/projects/ebaz4205/Makefile`
+  (ADI library-mk builds `component.xml`). `uart_phy` and `case_toggle` are
+  removed from `LIB_DEPS`.
 
 ### 3. Device tree — `u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso`
 
@@ -301,15 +306,6 @@ The driver source already ships in this kernel tree (`drivers/staging/axis-fifo/
 First action item: confirm it builds cleanly against the 6.12 tree before any HDL
 work (staging-driver API churn is the top risk).
 
-### 2b. HDL — new `hdl/library/case_toggle/`
-
-`case_toggle.sv` (same repo conventions): a simple registered FSM that accepts
-a byte on bf2_soc-style `io_rx_*` (level-drain), XORs with 0x20 (ASCII bit 5),
-and presents it on `io_tx_*` (single-cycle strobe).  Used as a test stand-in
-for bf2_soc while the bridge path is validated.
-
-Deliverables: module + `Makefile` + `tb_case_toggle.sv` + `case_toggle_ip.tcl`.
-
 ### 5. Userspace
 
 - Device node: `axis_fifo_%pa` name pattern — expect `/dev/axis_fifo_7c450000`
@@ -331,10 +327,10 @@ Deliverables: module + `Makefile` + `tb_case_toggle.sv` + `case_toggle_ip.tcl`.
 | Driver build | `make sdimg` (linux-modules → buildroot post-build modules_install) | `axis_fifo` compiles; `axis-fifo.ko` + `modules.dep` present in `buildroot/output/target/lib/modules/…` and in `build_sdimg/rootfs.ext4` (`debugfs -R "ls -l /lib/modules/…"`) |
 | On-board — module presence | `./scripts/ebaz_deploy.sh` (live update: boot files + `lib/modules` tree over ssh, no rootfs dd) then `modprobe axis_fifo` | `axis-fifo.ko` lands in `/lib/modules/$(uname -r)/`; `modprobe axis_fifo` binds the DT node (modalias autoload), `/dev/axis_fifo_7c450000` appears |
 | RTL sim — bridge | `make -C hdl/library/axis_byte_bridge sim` | one byte per word (upper 24 dropped/zeroed), TLAST per word on S_AXIS, TREADY stall both directions, `io_tx_valid` strobe landing on blocked `S_AXIS` (v1 staging-register case), back-to-back bytes both directions |
-| RTL sim — case_toggle | `make -C hdl/library/case_toggle sim` | known letters toggle (A↔a, Z↔z), TX blocked → io_rx_ready backpressure, strobe is single-cycle |
+| RTL sim — case_toggle (Phase 1, retained in library) | `make -C hdl/library/case_toggle sim` | known letters toggle (A↔a, Z↔z), TX blocked → io_rx_ready backpressure, strobe is single-cycle |
 | Integration sim | `bf2_soc` + bridge + stream model TB (like `tb_bf1_soc_uart.sv`) | full-duplex echo, backpressure stall, zero-loss under slow drain |
 | Lint | verilator `--lint-only -Wall` exit 0 (no warnings), verible exit 0 | clean |
-| BD build | ADI make (bitstream) | place/route, timing |
+| BD build — Phase 2 wiring | ADI make (bitstream); verify `axi_uartlite_0`/`uart_phy_0`/`case_toggle_0` absent from `report_utilization` | place/route, timing; no stale IP in netlist |
 | On-board — PS→PL | `dd if=bigfile of=/dev/axis_fifo_7c450000 bs=4`; bf2 program echoes back | byte count matches, zero loss |
 | On-board — backpressure | bf2 runs compute-only (no `,`) for T seconds while PS streams | PS `write()` blocks (rate ≈ 0 during stall); after resume, all bytes arrive intact |
 | On-board — full duplex | simultaneous read + write streams (Python shim) | no cross-talk, no loss either way |
@@ -355,15 +351,12 @@ Deliverables: module + `Makefile` + `tb_case_toggle.sv` + `case_toggle_ip.tcl`.
 
 ## Open questions
 
-1. Keep `axi_uartlite_0` in the BD as a spare serial port (e.g. future echo_char
-   loopback), or remove entirely? (Decision: **keep** — bf2_soc remains functional on this
-   path through phase 1; uartlite removed in phase 2.)
-2. FIFO depth 1024 words each — enough? With v1 a word holds 1 byte, so the FIFOs
+1. FIFO depth 1024 words each — enough? With v1 a word holds 1 byte, so the FIFOs
    hold 1024 bytes/direction (v2 would quadruple that). (TX FIFO absorbs PS bursts;
    RX FIFO absorbs PL bursts.)
-3. Should the adapter be IP-packaged (`axis_byte_bridge_ip.tcl`) or instantiated as
+2. Should the adapter be IP-packaged (`axis_byte_bridge_ip.tcl`) or instantiated as
    plain RTL in the BD? (Plain RTL first; package if reused.)
-4. v1 `read()` granularity is one word (4 bytes) per call with 3 zero bytes — is the
+3. v1 `read()` granularity is one word (4 bytes) per call with 3 zero bytes — is the
    shim compacting to 1 byte per read acceptable, or should v2 (4 bytes/word) land
    sooner to make `read()`/`write()` byte-for-byte? (Recommend: v1 first, measure,
    then decide.)
@@ -373,6 +366,6 @@ Deliverables: module + `Makefile` + `tb_case_toggle.sv` + `case_toggle_ip.tcl`.
 - Xilinx PG080 — AXI4-Stream FIFO product guide (store-forward, TLR/RLR, ports)
 - `linux/drivers/staging/axis-fifo/axis-fifo.c` + `axis-fifo.txt` (driver semantics,
   DT binding, limitations)
-- `doc/PL_TTY_DEVICE.md` — current AXI UART Lite path being replaced
+- `doc/PL_TTY_DEVICE.md` — the AXI UART Lite path that was replaced (retained as reference)
 - `doc/UART_PHY.md` — `uart_phy` parallel contract (`rx_valid`/`rx_accept_i`/`rx_ready`)
   that `axis_byte_bridge` reuses on the `bf2_soc` side

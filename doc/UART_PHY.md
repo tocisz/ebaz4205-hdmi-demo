@@ -300,12 +300,14 @@ uart_phy #(.ClkFreq(CLK_FREQ), .Baud(BAUD)) u_phy (
 | `tx_start`      | `io_tx_valid`   | must never fire while `tx_ready` low (back-to-back writes) |
 | `tx_ready`      | `io_tx_ready`   |      |
 
-### PS side (Linux) — full board path
+### PS side (Linux) — original board-level usage (historical)
 
-`system_bd.tcl` connects a Xilinx **AXI UART Lite** (0x7C430000, IRQ 57,
-`/dev/ttyUL1` via the `uartlite` driver) to `uart_phy`'s serial line, and the
-`bf2_soc` softcore to its parallel side — Linux drives the softcore's UART
-"as if it were an external UART".
+In the original `bf2_soc` design, `system_bd.tcl` connected a Xilinx **AXI UART
+Lite** (0x7C430000, IRQ 57) to `uart_phy`'s serial line, and the `bf2_soc`
+softcore to its parallel side — Linux drove the softcore's UART "as if it were
+an external UART". This path has since been replaced by the AXI-Stream FIFO
+bridge (`doc/AXIS_FIFO_BRIDGE.md` Phase 2), but the wiring example below
+remains valid for any future design that reuses `uart_phy` with a UART Lite.
 
 | `uart_phy` port  | Connection                  | Note |
 |------------------|-----------------------------|------|
@@ -314,14 +316,14 @@ uart_phy #(.ClkFreq(CLK_FREQ), .Baud(BAUD)) u_phy (
 | `rx_data`/`rx_valid`/`rx_accept_i` | `bf2_soc_0/io_rx_*` | Softcore drains while executing `,` (`io_rx_ready = io_rd_pending && !halted`) |
 | `tx_data`/`tx_start`/`tx_ready`    | `bf2_soc_0/io_tx_*` | Softcore stalls on `!tx_ready` (`io_stall`) |
 
-**Backpressure (PS→PL): none end-to-end.** The uartlite driver blocks
-`write()` only when the AXI UART Lite's own 16-byte TX FIFO is full — i.e. only
-at the wire baud rate (115200 ≈ 11.5 KB/s). The wire has no RTS/CTS (AXI UART
-Lite, PG142, has no modem pins), and FIFO overflow here is **silent** (§7):
-`rx_ready` is invisible to the PS. A long PS→PL stream while `bf2_soc` is not
-executing `,` therefore drops bytes. Options for real backpressure: AXI
-UART16550 + RTS/CTS wired to `rx_ready` (no `uart_phy` RTL change), or an
-AXI-visible parallel-side bridge. See `doc/PL_TTY_DEVICE.md`.
+**Backpressure (PS→PL) in this configuration: none end-to-end.** The uartlite
+driver blocks `write()` only when the AXI UART Lite's own 16-byte TX FIFO is
+full — i.e. only at the wire baud rate (115200 ≈ 11.5 KB/s). The wire has no
+RTS/CTS (AXI UART Lite, PG142, has no modem pins), and FIFO overflow here is
+**silent** (§7): `rx_ready` is invisible to the PS. A long PS→PL stream while
+`bf2_soc` is not executing `,` therefore drops bytes. Options for real
+backpressure: AXI UART16550 + RTS/CTS wired to `rx_ready` (no `uart_phy` RTL
+change), or an AXI-visible parallel-side bridge. See `doc/PL_TTY_DEVICE.md`.
 
 ---
 
