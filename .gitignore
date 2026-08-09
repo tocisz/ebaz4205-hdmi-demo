@@ -47,3 +47,6 @@ xvlog.log
 # Brainfuck demo generated artifacts
 demos/brainfuck_org/bin/
 demos/brainfuck_org/__pycache__/
+
+# pi agent state
+.pi/
