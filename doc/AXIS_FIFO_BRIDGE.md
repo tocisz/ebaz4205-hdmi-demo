@@ -349,6 +349,12 @@ work (staging-driver API churn is the top risk).
 | `-EAGAIN` on wait timeouts | Userspace retry loop or `O_NONBLOCK` + `poll()` |
 | v1 wastes 3/4 of stream bandwidth (1 byte/word) | ~100 MB/s class at 100 MHz, still ~10⁴× the uartlite wire rate — irrelevant for a byte stream; if it ever matters, swap the adapter for v2 (4 bytes/word), no IP/driver/DT change |
 
+## Known issues
+
+| Issue | Status | Workaround / Fix |
+|---|---|---|
+| Stale byte in bridge staging register survives CPU halt+reset. The `axis_byte_bridge` v1 drop-24 has no reset signal, so a byte captured by `tx_valid` from a previous run stays in the 1-deep staging register even after `bf2_soc` reset. `flush_fifo()` in `run_bf1_program.py` tries to drain it via `select()` polling, but the AXI-Stream FIFO IP's internal pipeline can make the byte readable after the settle window expires. Result: a garbage prefix on the first read of a consecutive program run. | **Open** — no reliable software workaround found. | Add synchronous reset to `axis_byte_bridge` (connect to `bf2_soc` reset or a PL-side reset signal), or migrate to v2 byte-packer which uses `fifo_sync` (with dedicated reset). See TODO in `run_bf1_program.py`. |
+
 ## Open questions
 
 1. FIFO depth 1024 words each — enough? With v1 a word holds 1 byte, so the FIFOs

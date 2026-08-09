@@ -7,17 +7,18 @@ Intended for use *on the board* (e.g. installed as /root/bf1). Accepts either:
   - precompiled bf1 bytecode (.bin)
 
 Loads bytecode into code RAM, clears data RAM (fast on-CPU BF program; see
-CLEAR_DATA_RAM.md), starts the CPU, and puts the program's UART on your console.
+CLEAR_DATA_RAM.md), starts the CPU, and bridges I/O through the PS↔PL
+AXI-Stream FIFO bridge (v1 drop-24, /dev/axis_fifo_0x7c450000).
 
 Usage (on board):
   bf1 hello.b
   bf1 hello.b -n 256 -o /tmp/out.txt
-  bf1 ghost.b -i                         # interactive: live keyboard ↔ UART
+  bf1 ghost.b -i                         # interactive: live keyboard ↔ bf2_soc
   bf1 prog.b --input $'a\nb\n' -n 100    # batch feed for ',' programs
 
   Brainfuck programs do not halt the CPU. Batch capture stops on max-bytes,
-  UART idle, or max-time (default 30s). Interactive mode (-i) streams output
-  live and forwards your keyboard until Ctrl-C / Ctrl-].
+  FIFO idle, or max-time (default 30s). Interactive mode (-i) streams output
+  live and forwards your keyboard until Ctrl-C / Ctrl-D (\0) / Ctrl-].
 
 Comments:
   Non-command characters are ignored. Bracketed dead-loops like
@@ -25,10 +26,19 @@ Comments:
   0 — true after data-RAM clear). Unmatched ``[``/``]`` still fail to compile.
 
 Dependencies:
-  - Board running the bf1 SoC design (axi_gpreg at 0x7C440000).
-  - Root access to /dev/mem and /dev/ttyUL1.
+  - Board running the bf2_soc design (axi_gpreg at 0x7C440000, bridge at 0x7C450000).
+  - Root access to /dev/mem and /dev/axis_fifo_0x7c450000.
   - Python 3 with mmap, select, struct, termios (stdlib).
   - comp_bf.py beside this script (only needed when given a .b source).
+
+Known problem — stale bytes between runs:
+  The axis_byte_bridge v1 drop-24 has no reset signal. A byte captured in its
+  1-deep staging register from a previous run survives CPU halt+reset.
+  ``flush_fifo()`` attempts to drain this by polling with select(), but the
+  AXI-Stream FIFO IP's internal pipeline can delay availability beyond the
+  settle window.  Consecutive runs of ``bf1`` may see a garbage prefix.
+  TODO: add a reset input to axis_byte_bridge, or switch to the v2 byte-packer
+  which uses fifo_sync (with a dedicated reset).
 """
 
 import argparse
@@ -37,7 +47,6 @@ import mmap
 import os
 import select
 import struct
-import subprocess as sp
 import sys
 import termios
 import time
@@ -71,9 +80,8 @@ _RUN   = 1 << 3
 CODE_RAM_SIZE = 8192   # 8K × 8
 DATA_RAM_SIZE = 32768  # 32K × 8
 
-# UART
-UART_DEV = "/dev/ttyUL1"
-UART_BAUD = 115200
+# AXI-Stream FIFO device (v1 drop-24 bridge → bf2_soc)
+FIFO_DEV = "/dev/axis_fifo_0x7c450000"
 
 # ---------------------------------------------------------------------------
 # Fast data-RAM clear (binary riding counter on the bf1 CPU)
@@ -264,41 +272,89 @@ class Bf1Board:
 
 
 # ===================================================================
-# UART helpers
+# FIFO helpers
 # ===================================================================
 
-def setup_uart(device: str = UART_DEV, baud: int = UART_BAUD):
-    """Configure the UART port and return a non-blocking fd."""
-    sp.run(
-        ["stty", "-F", device, str(baud),
-         "-echo", "-onlcr", "raw"],
-        capture_output=True,
-        check=True,
-    )
-    return os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+def open_fifo(device: str = FIFO_DEV) -> int:
+    """Open the axis_fifo device for read/write (non-blocking from open).
+
+    Must be non-blocking from open() time because the driver caches
+    f->f_flags at open() and never re-reads it; an fcntl(F_SETFL)
+    after open is invisible to the driver's read/write paths.
+    """
+    return os.open(device, os.O_RDWR | os.O_NONBLOCK)
 
 
-def drain_uart(fd):
-    """Discard any stale data lingering in the UART RX buffer."""
+def write_byte(fd: int, b: int) -> None:
+    """Send one byte through the v1 drop-24 bridge.
+
+    The driver requires 4-byte writes.  We pad to 4 bytes; the bridge's
+    [7:0] carries the actual byte and upper 24 bits are dropped.
+    """
+    os.write(fd, bytes([b, 0, 0, 0]))
+
+
+def read_byte(fd: int) -> int | None:
+    """Read one byte from the v1 drop-24 bridge.
+
+    Returns the byte or None if no data available (EAGAIN).
+    Each read() returns one 4-byte packet from the RX FIFO; byte 0 is data.
+    """
+    try:
+        word = os.read(fd, 4)
+        if not word:
+            return None
+        return word[0]
+    except (BlockingIOError, OSError):
+        return None
+
+
+def flush_fifo(fd, settle: float = 0.05):  # XXX: unreliable — see docstring TODO
+    """Flush all stale bytes from the FIFO RX buffer.
+
+    The bf2_soc TX pipeline + bridge 1-deep staging register can hold
+    a byte from a previous run that survives CPU reset (the bridge has
+    no reset signal).  This function drains the FIFO, then uses
+    ``select()`` to wait for any delayed byte to arrive through the PL
+    pipeline, then drains again.
+
+    ``settle`` — max wall time to wait for a delayed byte (default 50 ms).
+
+    .. warning::
+       This does **not** reliably flush the bridge's staging register.
+       The AXI-Stream FIFO IP may delay the byte beyond ``settle``.
+       See module docstring for the known problem.
+    """
+    # 1. Drain anything already readable.
     while True:
-        rl, _, _ = select.select([fd], [], [], 0.05)
+        b = read_byte(fd)
+        if b is None:
+            break
+
+    # 2. Wait for any byte trickling through the PL pipeline.
+    deadline = time.monotonic() + settle
+    while time.monotonic() < deadline:
+        rl, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
         if not rl:
-            return
-        try:
-            if not os.read(fd, 4096):
-                return
-        except BlockingIOError:
-            return
+            break  # settle window expired with no data
+        # Drain whatever arrived.
+        while True:
+            b = read_byte(fd)
+            if b is None:
+                break
 
 
-def capture_uart_output(
+def capture_fifo_output(
     fd,
     idle_timeout: float = 0.5,
     min_idle_loops: int = 3,
     max_bytes: int | None = None,
     max_time: float | None = 30.0,
 ) -> tuple[bytes, str]:
-    """Read UART with bounded capture. Returns (data, stop_reason).
+    """Read FIFO with bounded capture. Returns (data, stop_reason).
+
+    Each read() returns one 4-byte packet; byte 0 is the actual data
+    (v1 drop-24: upper 24 bits are zero).
 
     Stop reasons:
       max_bytes — reached byte limit
@@ -310,62 +366,49 @@ def capture_uart_output(
     t0 = time.monotonic()
 
     while True:
-        # 1. Byte limit check (highest priority)
         if max_bytes is not None and len(out) >= max_bytes:
             return bytes(out[:max_bytes]), "max_bytes"
 
-        # 2. Time limit check
         if max_time is not None and (time.monotonic() - t0) >= max_time:
             return bytes(out), "max_time"
 
-        # 3. Idle detection
         if idle_count >= min_idle_loops:
             return bytes(out), "idle"
 
         rl, _, _ = select.select([fd], [], [], idle_timeout)
         if rl:
-            try:
-                to_read = 4096 if max_bytes is None else max(1, max_bytes - len(out))
-                chunk = os.read(fd, to_read)
-                if chunk:
-                    out.extend(chunk)
-                    idle_count = 0
-                    continue
-            except BlockingIOError:
-                pass
+            b = read_byte(fd)
+            if b is not None:
+                out.append(b)
+                idle_count = 0
+                continue
         idle_count += 1
 
 
-def feed_uart_input(fd, data: bytes, inter_byte_delay: float = 0.0) -> None:
-    """Write ``data`` to the UART (program ``,`` input). Optional pacing."""
+def feed_fifo_input(fd, data: bytes, inter_byte_delay: float = 0.0) -> None:
+    """Write ``data`` to the FIFO (program ``,`` input). Optional pacing."""
     if not data:
         return
-    if inter_byte_delay <= 0:
-        os.write(fd, data)
-        return
     for b in data:
-        os.write(fd, bytes([b]))
-        time.sleep(inter_byte_delay)
+        write_byte(fd, b)
+        if inter_byte_delay > 0:
+            time.sleep(inter_byte_delay)
 
 
 def interactive_session(
-    uart_fd,
+    fifo_fd,
     max_time: float | None = None,
     max_bytes: int | None = None,
-    cr_to_lf: bool = True,
 ) -> tuple[bytes, str]:
-    """Live console bridge: keyboard → UART TX, UART RX → stdout.
+    """Live console bridge: keyboard → FIFO TX, FIFO RX → stdout.
 
     Returns (captured_output, stop_reason) where stop_reason is one of:
-      quit / interrupt / eof / max_time / max_bytes
+      quit / interrupt / ctrl_d / eof / max_time / max_bytes
 
     Keys (when stdin is a TTY, local terminal is put in raw mode):
-      Ctrl-C (\\x03)  — stop (same as SIGINT)
-      Ctrl-] (\\x1d)  — stop (telnet-style escape; useful if Ctrl-C is trapped)
-      Enter           — sent as LF (\\n) when cr_to_lf is True (default)
-
-    Non-TTY stdin (piped input) is still forwarded; EOF ends the session after
-    draining remaining UART output briefly.
+      Ctrl-C (\x03)  — stop (same as SIGINT)
+      Ctrl-D (\x04)  — send \\0 byte through the bridge, then exit
+      Ctrl-] (\x1d)  — stop (telnet-style escape; useful if Ctrl-C is trapped)
     """
     out = bytearray()
     stdin_fd = sys.stdin.fileno()
@@ -375,10 +418,8 @@ def interactive_session(
     old_term = None
     if is_tty:
         old_term = termios.tcgetattr(stdin_fd)
-        # raw: deliver keys immediately, no local echo (program paints the screen)
         tty.setraw(stdin_fd)
 
-    # Make stdin non-blocking so select is the sole gate.
     old_stdin_flags = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
     fcntl.fcntl(stdin_fd, fcntl.F_SETFL, old_stdin_flags | os.O_NONBLOCK)
 
@@ -395,7 +436,7 @@ def interactive_session(
                 stop_reason = "max_time"
                 break
 
-            rlist = [uart_fd]
+            rlist = [fifo_fd]
             if stdin_open:
                 rlist.append(stdin_fd)
 
@@ -405,79 +446,59 @@ def interactive_session(
                 stop_reason = "interrupt"
                 break
 
-            if uart_fd in rl:
-                try:
-                    to_read = 4096 if max_bytes is None else max(1, max_bytes - len(out))
-                    chunk = os.read(uart_fd, to_read)
-                except BlockingIOError:
-                    chunk = b""
-                if chunk:
-                    out.extend(chunk)
+            # ── RX from FIFO → stdout ──
+            if fifo_fd in rl:
+                while True:
+                    b = read_byte(fifo_fd)
+                    if b is None:
+                        break
+                    out.append(b)
                     try:
-                        disp = chunk.replace(b'\n', b'\r\n') if is_tty else chunk
-                        os.write(stdout_fd, disp)
+                        chunk = bytes([b]).replace(b"\n", b"\r\n") if is_tty else bytes([b])
+                        os.write(stdout_fd, chunk)
                     except OSError:
                         pass
                     if max_bytes is not None and len(out) >= max_bytes:
                         stop_reason = "max_bytes"
                         break
+                if stop_reason == "max_bytes":
+                    break
 
+            # ── stdin → TX to FIFO ──
             if stdin_open and stdin_fd in rl:
                 try:
                     data = os.read(stdin_fd, 256)
                 except BlockingIOError:
                     data = b""
+
                 if not data:
-                    # EOF on stdin — keep reading UART a little, then exit
-                    stdin_open = False
-                    # brief drain of any remaining/following output
-                    drain_deadline = time.monotonic() + 0.3
-                    while time.monotonic() < drain_deadline:
-                        rl2, _, _ = select.select([uart_fd], [], [], 0.05)
-                        if not rl2:
-                            continue
-                        try:
-                            chunk = os.read(uart_fd, 4096)
-                        except BlockingIOError:
-                            chunk = b""
-                        if chunk:
-                            out.extend(chunk)
-                            try:
-                                disp = chunk.replace(b'\n', b'\r\n') if is_tty else chunk
-                                os.write(stdout_fd, disp)
-                            except OSError:
-                                pass
-                            drain_deadline = time.monotonic() + 0.3
-                        else:
-                            break
+                    # EOF on stdin — send null, then stop
+                    write_byte(fifo_fd, 0)
                     stop_reason = "eof"
                     break
 
-                # Local stop keys (raw mode delivers these as bytes)
+                # Local stop keys
                 if b"\x03" in data:  # Ctrl-C
                     stop_reason = "interrupt"
+                    break
+                if b"\x04" in data:  # Ctrl-D → send \0 byte, then stop
+                    write_byte(fifo_fd, 0)
+                    stop_reason = "ctrl_d"
                     break
                 if b"\x1d" in data:  # Ctrl-]
                     stop_reason = "quit"
                     break
 
-                if cr_to_lf:
-                    data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                # Forward keystrokes — each byte as a 4-byte padded word
+                for byte_val in data:
+                    write_byte(fifo_fd, byte_val)
 
-                if data:
-                    try:
-                        os.write(uart_fd, data)
-                    except OSError as e:
-                        print(f"\n[uart write error: {e}]", file=sys.stderr)
-                        stop_reason = "uart_error"
-                        break
     except KeyboardInterrupt:
         stop_reason = "interrupt"
     finally:
         fcntl.fcntl(stdin_fd, fcntl.F_SETFL, old_stdin_flags)
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
-        # Ensure cursor returns to a fresh line after raw mode
         if is_tty:
             try:
                 os.write(stdout_fd, b"\r\n")
@@ -557,13 +578,13 @@ def parse_args(argv=None):
             "Examples (on board):\n"
             "  %(prog)s hello.b\n"
             "  %(prog)s sierpinski.b -n 1552\n"
-            "  %(prog)s ghost.b -i                  # live keyboard ↔ UART\n"
+            "  %(prog)s ghost.b -i                  # live keyboard ↔ bf2_soc\n"
             "  %(prog)s prog.b --input $'a\\nb\\n' -n 100\n"
             "  %(prog)s prog.b --save-bin prog.bin --no-clear-data-ram\n"
             "\n"
             "Batch mode: BF does not halt — capture stops on --max-bytes,\n"
-            "UART idle, or --max-time (default 30s). Output is printed.\n"
-            "Interactive (-i): live I/O; quit with Ctrl-C or Ctrl-].\n"
+            "FIFO idle, or --max-time (default 30s). Output is printed.\n"
+            "Interactive (-i): live I/O; quit with Ctrl-C, Ctrl-D (\\0), or Ctrl-].\n"
             "Comments: non-ops ignored; balanced [dead loops] OK when cell=0.\n"
         ),
     )
@@ -578,7 +599,7 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--output", "-o",
-        help="Also save captured UART output to this file",
+        help="Also save captured output to this file",
     )
     p.add_argument(
         "--max-bytes", "-n", type=int, default=None,
@@ -593,7 +614,7 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--timeout", "-t", type=float, default=0.5,
-        help="UART idle-detection window in seconds (batch mode; default: 0.5)",
+        help="FIFO idle-detection window in seconds (batch mode; default: 0.5)",
     )
     p.add_argument(
         "--min-idle", type=int, default=3,
@@ -603,8 +624,8 @@ def parse_args(argv=None):
         "-i", "--interactive",
         action="store_true",
         help=(
-            "Live console: stream UART output as it arrives and forward "
-            "keyboard to the program (for ',' input). Quit: Ctrl-C or Ctrl-]."
+            "Live console: stream output as it arrives and forward "
+            "keyboard to the program (for ',' input). Quit: Ctrl-C, Ctrl-D (\\0), or Ctrl-]."
         ),
     )
     p.add_argument(
@@ -612,7 +633,7 @@ def parse_args(argv=None):
         metavar="DATA",
         default=None,
         help=(
-            "Batch-mode only: bytes to send on UART after start "
+            "Batch-mode only: bytes to send on FIFO after start "
             "(use $'...' escapes). Prefix @file to read a file."
         ),
     )
@@ -623,11 +644,7 @@ def parse_args(argv=None):
         metavar="SEC",
         help="Delay between --input bytes (default: 0)",
     )
-    p.add_argument(
-        "--no-cr-to-lf",
-        action="store_true",
-        help="Interactive: do not translate Enter (CR) to LF",
-    )
+    # (cr_to_lf not needed — FIFO delivers raw bytes; no serial CR/LF translation)
     p.add_argument(
         "--no-clear-data-ram", action="store_true",
         help=(
@@ -741,14 +758,17 @@ def main():
         # on-CPU clear program, which leaves PC in its trailing spin-loop.
         board.reset()
 
-        fd = setup_uart()
-        drain_uart(fd)
+        fd = open_fifo()
+        # Flush stale bytes from the bf2_soc TX pipeline and bridge staging
+        # register (the bridge has no reset signal).  Uses select() to wait
+        # for any byte trickling through the PL pipeline.
+        flush_fifo(fd)
 
         t0 = time.monotonic()
         board.run()
 
         if args.interactive:
-            _log("Interactive — quit with Ctrl-C or Ctrl-]", quiet=quiet)
+            _log("Interactive — quit with Ctrl-C, Ctrl-D (\\0), or Ctrl-]", quiet=quiet)
             if not os.isatty(sys.stdin.fileno()):
                 print(
                     "note: stdin is not a TTY (use `ssh -t` for a real keyboard)",
@@ -758,14 +778,13 @@ def main():
                 fd,
                 max_time=max_time,
                 max_bytes=max_bytes,
-                cr_to_lf=not args.no_cr_to_lf,
             )
         else:
             if input_bytes:
                 time.sleep(0.05)  # let CPU reach first ',' if any
-                feed_uart_input(fd, input_bytes, args.input_delay)
+                feed_fifo_input(fd, input_bytes, args.input_delay)
                 _log(f"Fed {len(input_bytes)}B input", quiet=quiet)
-            output, stop_reason = capture_uart_output(
+            output, stop_reason = capture_fifo_output(
                 fd,
                 idle_timeout=args.timeout,
                 min_idle_loops=args.min_idle,
