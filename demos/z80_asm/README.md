@@ -45,6 +45,13 @@ python3 demos/z80_asm/z80.py demos/z80_asm/src/counter.s -n 64
 
 # Interactive (allocates a TTY via ssh -t)
 python3 demos/z80_asm/z80.py demos/z80_asm/src/echo.s -i
+
+# Load separate ROM and RAM images.  A nonzero --rom-org generates
+# JP --rom-org at ROM address 0; --ram-org is a Z80 RAM address.
+python3 demos/z80_asm/z80.py run \
+    --rom demos/z80_asm/src/boot.s \
+    --ram demos/z80_asm/src/counter.s --ram-org 0x2000 \
+    -n 3
 ```
 
 Environment overrides:
@@ -86,6 +93,7 @@ python3 demos/z80_asm/z80.py sim bin/counter.bin
 | Counter | `src/counter.s` | `00 01 02 03 … FF 00 01 …` | Infinite loop |
 | Echo | `src/echo.s` | Echoes back any byte sent | Interactive |
 | Walk | `src/walk.s` | Pattern 00–FF written to RAM, then output | Infinite loop |
+| Memtest | `src/memtest.s` | Full RAM test; outputs error count and pass/fail | Run from ROM |
 | Boot | `src/boot.s` | `jp 0x2000` (3 bytes) | ROM bootstrap |
 
 ## Architecture
@@ -94,7 +102,7 @@ The FPGA design replaces the old `bf2_soc` (Brainfuck CPU) with a Z80-compatible
 SoC. The PS (ARM A9) communicates with the Z80 through:
 
 - **`ctrl_gp0`** (axi_gpreg @0x7C440000): CPU control — halt, run, step, reset
-- **`ctrl_gp1`** (axi_gpreg @0x7C440044): RAM access (8 KB, Z80 address 0x2000+)
+- **`ctrl_gp1`** (axi_gpreg @0x7C440044): RAM access (56 KB, Z80 address 0x2000-0xFFFF; GP address is a zero-based offset)
 - **`ctrl_gp2`** (axi_gpreg @0x7C440084): ROM access (8 KB, Z80 address 0x0000-0x1FFF)
 - **`/dev/axis_fifo_0x7c450000`**: byte stream I/O (Z80 `IN`/`OUT` port 0)
 
@@ -106,14 +114,19 @@ Same as bf2_soc — see `doc/Z80_SOC_PLAN.md` or `doc/AXIS_FIFO_BRIDGE.md`.
 
 1. **Finite capture**: Infinite-loop programs need `-n N` or `--max-time SEC`.
 2. **Boot ROM**: Written once per FPGA boot. The runner checks and skips if present.
-3. **Stale FIFO bytes**: The v1 axis_byte_bridge has no reset and can hold a byte
-   from a previous run. The runner flushes before starting.
+3. **FIFO state between runs**: The AXI FIFO and bridge staging register are
+   independent of the Z80 ctrl reset. The runner resets both FIFO data paths,
+   then drains any remaining packets before starting a new program.
 4. **Interactive**: `ssh -t ebaz z80 echo.bin -i` (`-t` is required for TTY).
    Quit with Ctrl-C or Ctrl-].
-5. **Out of RAM**: 8 KB limit. Assemble first to check binary size.
-6. **Stale board process**: Reset with `pkill -f "/root/z80|run_z80"; echo "done"`.
-7. **Memory map**: Code loaded to RAM offset 0 → Z80 sees it at 0x2000.
-   The boot ROM (0x0000) must contain `jp 0x2000`.
+5. **Image origins**: `--ram-org` is a Z80 address in `0x2000–0xFFFF`.
+   If `--rom-org` is omitted, the ROM image is loaded at `0x0000` unchanged
+   and must contain its own reset vector. If `--rom-org 0x100` is given,
+   the runner loads the image at `0x0100` and generates `jp 0x0100` at reset.
+6. **Out of RAM**: 56 KB limit. Assemble first to check binary size.
+7. **Stale board process**: Reset with `pkill -f "/root/z80|run_z80"; echo "done"`.
+8. **Memory map**: Legacy code loaded to RAM address `0x2000`; the boot ROM
+   contains `jp 0x2000` unless an explicit ROM image is supplied.
 
 ## Layout
 

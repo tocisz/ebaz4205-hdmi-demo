@@ -12,6 +12,12 @@ Usage (on board):
   z80 counter.bin -n 256                # capture up to 256 bytes
   z80 echo.bin -i                       # interactive: send bytes, read back
   z80 program.bin --input $'abc\n'      # batch feed for 'IN' programs
+  z80 --rom-image rom.bin --rom-org 0x100 \
+      --ram-image program.bin --ram-org 0x2000 -n 64
+
+  With no --rom-org, a ROM image is loaded at 0x0000 unchanged and must
+  contain its own reset vector.  A nonzero --rom-org generates JP --rom-org
+  at ROM address 0x0000.
 
   Infinite-loop programs (counter, walk) need --max-bytes or --max-time.
   Interactive mode (-i) streams output live and forwards keyboard.
@@ -23,6 +29,7 @@ Dependencies:
 """
 
 import argparse
+import errno
 import fcntl
 import mmap
 import os
@@ -54,10 +61,14 @@ _RUN   = 1 << 3
 
 # Memory sizes
 ROM_SIZE = 8192   # 8K × 8
-RAM_SIZE = 8192   # 8K × 8
+RAM_SIZE = 56 * 1024   # 56K × 8 (Z80 addresses 0x2000–0xFFFF)
 
-# AXI-Stream FIFO device
+# AXI-Stream FIFO device and PG080 register map
 FIFO_DEV = "/dev/axis_fifo_0x7c450000"
+FIFO_BASE = 0x7C450000
+FIFO_TDFR = 0x08  # transmit FIFO reset (PS -> Z80)
+FIFO_RDFR = 0x18  # receive FIFO reset (Z80 -> PS)
+FIFO_RESET_VALUE = 0xA5
 
 # ---------------------------------------------------------------------------
 # Boot ROM: JP 0x2000 (3 bytes)
@@ -126,45 +137,58 @@ class Z80Board:
         self._w(GP2_OUT, 0)
         return v
 
-    def load_rom(self, data: bytes):
-        """Write bytes to ROM starting at address 0."""
-        for i, b in enumerate(data):
+    def load_rom(self, data: bytes, start: int = 0):
+        """Write ``data`` to ROM starting at CPU address ``start``."""
+        if start < 0 or start + len(data) > ROM_SIZE:
+            raise ValueError(
+                f"ROM image 0x{start:X}..0x{start + len(data) - 1:X} "
+                f"does not fit in {ROM_SIZE} bytes"
+            )
+        for i, b in enumerate(data, start):
             self.rom_write(i, b)
 
     # -- RAM (gp1) -----------------------------------------------------
 
     def ram_write(self, addr: int, data: int):
-        """Write one byte to RAM at ``addr`` (0 .. 8191)."""
+        """Write one byte to RAM at zero-based offset ``addr`` (0 .. 57343).
+
+        Offset 0 is Z80 address 0x2000; offset 0xDFFF is Z80 address
+        0xFFFF.
+        """
         assert 0 <= addr < RAM_SIZE
         self._w(GP1_OUT,
-                (addr & 0x1FFF) | ((data & 0xFF) << 16) | (1 << 24))
+                (addr & 0xFFFF) | ((data & 0xFF) << 16) | (1 << 24))
         self._wait_done(GP1_IN)
         self._w(GP1_OUT, 0)
 
     def ram_read(self, addr: int) -> int:
-        """Read one byte from RAM at ``addr``."""
+        """Read one byte from RAM at zero-based offset ``addr``."""
         assert 0 <= addr < RAM_SIZE
-        self._w(GP1_OUT, (addr & 0x1FFF) | (1 << 25))
+        self._w(GP1_OUT, (addr & 0xFFFF) | (1 << 25))
         self._wait_done(GP1_IN)
         v = self._r(GP1_IN) & 0xFF
         self._w(GP1_OUT, 0)
         return v
 
-    def load_ram(self, data: bytes):
-        """Load bytes into RAM starting at address 0."""
-        # Clear first (at least to program length)
-        clear_n = max(len(data), 16)
-        for i in range(min(clear_n, RAM_SIZE)):
+    def load_ram(self, data: bytes, start: int = 0):
+        """Load bytes into RAM at zero-based offset ``start``.
+
+        RAM offset 0 corresponds to Z80 address 0x2000.
+        """
+        if start < 0 or start + len(data) > RAM_SIZE:
+            raise ValueError(
+                f"RAM image offset 0x{start:X}..0x{start + len(data) - 1:X} "
+                f"does not fit in {RAM_SIZE} bytes"
+            )
+        clear_n = min(max(len(data), 16), RAM_SIZE - start)
+        for i in range(start, start + clear_n):
             self.ram_write(i, 0)
-        # Write program
-        for i, b in enumerate(data):
-            if i >= RAM_SIZE:
-                break
+        for i, b in enumerate(data, start):
             self.ram_write(i, b)
 
-    def verify_ram(self, data: bytes, n_check: int = 4) -> bool:
-        """Read back first ``n_check`` RAM locations and compare."""
-        return all(self.ram_read(i) == data[i]
+    def verify_ram(self, data: bytes, start: int = 0, n_check: int = 4) -> bool:
+        """Read back the first ``n_check`` bytes at RAM offset ``start``."""
+        return all(self.ram_read(start + i) == data[i]
                    for i in range(min(n_check, len(data))))
 
     # -- CPU control ---------------------------------------------------
@@ -223,6 +247,34 @@ def open_fifo(device: str = FIFO_DEV) -> int:
     return os.open(device, os.O_RDWR | os.O_NONBLOCK)
 
 
+def reset_fifo_buffers() -> None:
+    """Reset both AXI FIFO data paths before loading a new Z80 program.
+
+    The AXI FIFO and axis_byte_bridge have buffering independent of the
+    z80_soc ctrl_reset signal.  Draining the character device alone can miss
+    store-forward packets that become visible only after the next transfer.
+    The board runner already requires /dev/mem, so use the documented PG080
+    reset registers to discard both directions explicitly.
+    """
+    fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+    try:
+        mem = mmap.mmap(
+            fd, 0x1000, mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=FIFO_BASE,
+        )
+        try:
+            mem[FIFO_TDFR:FIFO_TDFR + 4] = struct.pack("<I", FIFO_RESET_VALUE)
+            mem[FIFO_RDFR:FIFO_RDFR + 4] = struct.pack("<I", FIFO_RESET_VALUE)
+        finally:
+            mem.close()
+    finally:
+        os.close(fd)
+    # Allow the FIFO reset and any bridge-stage transfer to settle before the
+    # drain pass below.
+    time.sleep(0.005)
+
+
 def write_byte(fd: int, b: int) -> None:
     """Send one byte through the v1 drop-24 bridge (4-byte write)."""
     os.write(fd, bytes([b & 0xFF, 0, 0, 0]))
@@ -231,32 +283,54 @@ def write_byte(fd: int, b: int) -> None:
 def read_byte(fd: int) -> int | None:
     """Read one byte from the v1 drop-24 bridge.
 
-    Returns the byte or None if no data available (EAGAIN).
+    Returns the byte or None if no data is available.  The axis-fifo driver
+    can report both EAGAIN and EINVAL while a packet is not yet readable;
+    both are treated as transient for non-blocking reads.  Other errors are
+    propagated instead of being silently mistaken for an empty FIFO.
     """
     try:
         word = os.read(fd, 4)
         if not word:
             return None
         return word[0]
-    except (BlockingIOError, OSError):
+    except BlockingIOError:
         return None
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
+            return None
+        raise
 
 
-def flush_fifo(fd, settle: float = 0.05):
-    """Flush all stale bytes from the FIFO RX buffer."""
+def flush_fifo(fd, settle: float = 0.10) -> int:
+    """Flush stale RX packets until the FIFO is quiet for ``settle`` seconds.
+
+    The FIFO and byte bridge are pipelined, so a single empty read is not
+    sufficient to establish that the previous program's output is gone.
+    Return the number of packets discarded; this is useful for diagnostics.
+    """
+    discarded = 0
+    quiet_deadline = time.monotonic() + settle
+
     while True:
-        b = read_byte(fd)
-        if b is None:
-            break
-    deadline = time.monotonic() + settle
-    while time.monotonic() < deadline:
-        rl, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
-        if not rl:
-            break
+        got_data = False
         while True:
             b = read_byte(fd)
             if b is None:
                 break
+            discarded += 1
+            got_data = True
+
+        now = time.monotonic()
+        if got_data:
+            quiet_deadline = now + settle
+        if now >= quiet_deadline:
+            return discarded
+
+        # Wait for either another packet or the quiet period to expire.  A
+        # short timeout is intentional: some axis-fifo driver versions do
+        # not make poll/select edge notifications reliable after EINVAL.
+        timeout = min(0.005, quiet_deadline - now)
+        select.select([fd], [], [], max(0.0, timeout))
 
 
 def capture_fifo_output(
@@ -312,7 +386,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("program", help="Z80 binary (.bin) to load")
+    parser.add_argument("program", nargs="?",
+                        help="Legacy RAM binary (.bin) to load")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="Live console: keyboard ↔ Z80 I/O")
     parser.add_argument("-n", "--max-bytes", type=int,
@@ -327,20 +402,67 @@ def main():
                         help=f"Axis FIFO device (default: {FIFO_DEV})")
     parser.add_argument("--no-boot-rom", action="store_true",
                         help="Skip writing the boot ROM (jp 0x2000)")
+    parser.add_argument("--run-from-rom", action="store_true",
+                        help="Legacy ROM-only mode; use --rom-image for multi-image loads")
+    parser.add_argument("--ram-image", help="RAM binary (.bin) to load")
+    parser.add_argument("--ram-org", type=lambda x: int(x, 0), default=0x2000,
+                        help="RAM image Z80 address (default: 0x2000)")
+    parser.add_argument("--rom-image", help="ROM binary (.bin) to load")
+    parser.add_argument("--rom-org", type=lambda x: int(x, 0), default=None,
+                        help="ROM image Z80 address; nonzero also generates JP at 0x0000")
     args = parser.parse_args()
 
-    # Load program binary
-    prog_path = Path(args.program)
-    if not prog_path.exists():
-        print(f"ERROR: program not found: {prog_path}", file=sys.stderr)
-        sys.exit(1)
-    program_bytes = prog_path.read_bytes()
-    if len(program_bytes) > RAM_SIZE:
-        print(f"ERROR: program {len(program_bytes)} bytes exceeds RAM {RAM_SIZE}", file=sys.stderr)
-        sys.exit(1)
+    if args.run_from_rom:
+        if args.program is None or args.ram_image or args.rom_image:
+            print("ERROR: --run-from-rom requires only the positional program", file=sys.stderr)
+            sys.exit(1)
+        if args.no_boot_rom:
+            print("ERROR: --run-from-rom requires its ROM boot vector", file=sys.stderr)
+            sys.exit(1)
+        rom_path = Path(args.program)
+        ram_path = None
+        rom_start = 0x0100 if args.rom_org is None else args.rom_org
+        generate_vector = True
+    else:
+        if args.program and args.ram_image:
+            print("ERROR: specify RAM input either positionally or with --ram-image, not both", file=sys.stderr)
+            sys.exit(1)
+        ram_path = Path(args.ram_image or args.program) if (args.ram_image or args.program) else None
+        rom_path = Path(args.rom_image) if args.rom_image else None
+        rom_start = 0 if args.rom_org is None else args.rom_org
+        generate_vector = rom_path is not None and rom_start != 0
 
-    if not args.quiet:
-        print(f"Program: {prog_path} ({len(program_bytes)} bytes)", file=sys.stderr)
+    if ram_path and not ram_path.exists():
+        print(f"ERROR: RAM program not found: {ram_path}", file=sys.stderr)
+        sys.exit(1)
+    if rom_path and not rom_path.exists():
+        print(f"ERROR: ROM image not found: {rom_path}", file=sys.stderr)
+        sys.exit(1)
+    ram_bytes = ram_path.read_bytes() if ram_path else None
+    rom_bytes = rom_path.read_bytes() if rom_path else None
+
+    if ram_bytes is None and rom_bytes is None:
+        print("ERROR: provide a RAM image/program and/or a ROM image", file=sys.stderr)
+        sys.exit(1)
+    if ram_bytes is not None:
+        ram_offset = args.ram_org - 0x2000
+        if args.ram_org < 0x2000 or ram_offset + len(ram_bytes) > RAM_SIZE:
+            print(
+                f"ERROR: RAM image range 0x{args.ram_org:X}.."
+                f"0x{args.ram_org + len(ram_bytes) - 1:X} is invalid "
+                "(RAM is 0x2000..0xFFFF)", file=sys.stderr)
+            sys.exit(1)
+    else:
+        ram_offset = 0
+    if rom_bytes is not None and (rom_start < 0 or rom_start + len(rom_bytes) > ROM_SIZE):
+        print(
+            f"ERROR: ROM image range 0x{rom_start:X}.."
+            f"0x{rom_start + len(rom_bytes) - 1:X} is invalid "
+            f"(ROM is 0x0000..0x{ROM_SIZE - 1:04X})", file=sys.stderr)
+        sys.exit(1)
+    if rom_bytes is not None and generate_vector and args.no_boot_rom:
+        print("ERROR: --no-boot-rom conflicts with nonzero --rom-org", file=sys.stderr)
+        sys.exit(1)
 
     # Open FIFO
     try:
@@ -356,9 +478,34 @@ def main():
             if not args.quiet:
                 print(f"  CPU reset, halted={brd.status()}", file=sys.stderr)
 
-            # Write boot ROM (only needs to be done once per FPGA boot)
-            if not args.no_boot_rom:
-                # Check if ROM already contains our boot vector
+            if rom_bytes is not None:
+                # An explicit ROM image is loaded exactly at rom_start.  If
+                # --rom-org was nonzero, prepend a reset-vector jump at 0.
+                if generate_vector:
+                    boot_vector = bytes([
+                        0xC3,
+                        rom_start & 0xFF,
+                        (rom_start >> 8) & 0xFF,
+                    ])
+                    brd.load_rom(boot_vector, 0)
+                if not args.quiet:
+                    print(
+                        f"  Loading ROM image at 0x{rom_start:04X} "
+                        f"({len(rom_bytes)} bytes)...",
+                        file=sys.stderr,
+                    )
+                brd.load_rom(rom_bytes, rom_start)
+                check_n = min(4, len(rom_bytes))
+                loaded = bytes(brd.rom_read(rom_start + i) for i in range(check_n))
+                if loaded != rom_bytes[:check_n]:
+                    print(f"  WARNING: ROM verify failed: {loaded.hex()}",
+                          file=sys.stderr)
+                elif not args.quiet:
+                    print("  ROM image verified OK", file=sys.stderr)
+                if generate_vector and not args.quiet:
+                    print(f"  Reset vector: JP 0x{rom_start:04X}", file=sys.stderr)
+            elif not args.no_boot_rom:
+                # Legacy RAM-only mode: install the standard JP 0x2000.
                 existing = bytes(brd.rom_read(i) for i in range(3))
                 if existing != BOOT_ROM:
                     if not args.quiet:
@@ -370,23 +517,36 @@ def main():
                             print("  Boot ROM verified OK", file=sys.stderr)
                     else:
                         print(f"  WARNING: boot ROM verify failed: {v.hex()}", file=sys.stderr)
-                else:
-                    if not args.quiet:
-                        print("  Boot ROM already present, skipping", file=sys.stderr)
+                elif not args.quiet:
+                    print("  Boot ROM already present, skipping", file=sys.stderr)
 
-            # Load program into RAM
-            if not args.quiet:
-                print(f"  Loading program to RAM...", file=sys.stderr)
-            brd.load_ram(program_bytes)
-            if not args.quiet:
-                ok = brd.verify_ram(program_bytes, min(4, len(program_bytes)))
-                print(f"  RAM verify: {'OK' if ok else 'FAILED'}", file=sys.stderr)
+            if ram_bytes is not None:
+                if not args.quiet:
+                    print(
+                        f"  Loading RAM image at 0x{args.ram_org:04X} "
+                        f"({len(ram_bytes)} bytes)...", file=sys.stderr)
+                brd.load_ram(ram_bytes, ram_offset)
+                if not args.quiet:
+                    ok = brd.verify_ram(ram_bytes, ram_offset, min(4, len(ram_bytes)))
+                    print(f"  RAM verify: {'OK' if ok else 'FAILED'}", file=sys.stderr)
 
-            # Flush any stale FIFO data
-            flush_fifo(fifo_fd)
+            # Reset and flush both FIFO directions.  The FIFO/bridge buffers
+            # are not reset by the z80_soc ctrl_reset signal.
+            reset_fifo_buffers()
+            discarded = flush_fifo(fifo_fd)
+            if discarded and not args.quiet:
+                print(f"  Discarded {discarded} stale FIFO packet(s)",
+                      file=sys.stderr)
 
-            # Start the CPU (reset again to ensure PC=0x0000, then run)
+            # Start the CPU (reset again to ensure PC=0x0000, then run).
+            # Repeat the FIFO reset after this reset to catch a byte that was
+            # held in the bridge staging register.
             brd.reset()
+            reset_fifo_buffers()
+            discarded = flush_fifo(fifo_fd)
+            if discarded and not args.quiet:
+                print(f"  Discarded {discarded} post-reset FIFO packet(s)",
+                      file=sys.stderr)
             brd.run()
             if not args.quiet:
                 print(f"  CPU running...", file=sys.stderr)

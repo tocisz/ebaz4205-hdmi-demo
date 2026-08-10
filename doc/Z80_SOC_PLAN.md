@@ -21,13 +21,13 @@ through Phase 3 (full HDMI + keyboard system).
 
 | What | How |
 |---|---|
-| Z80 CPU runs at 100 MHz | tv80 core (`tv80s` wrapper) at `sys_cpu_clk` |
+| Z80 CPU runs at 80 MHz | tv80 core (`tv80s` wrapper) at `sys_cpu_clk` |
 | PS loads/reads program memory | Dual-port BRAMs via `ctrl_gp1` (RAM) / `ctrl_gp2` (ROM) — same protocol as bf2_soc |
 | PS controls execution | `ctrl_gp0` bits for run/step/reset/halt — same as bf2_soc |
 | Z80 byte output reaches Linux | Z80 `OUT` → `io_tx_*` → axis_byte_bridge → AXI FIFO → `/dev/axis_fifo_7c450000` |
 | Linux sends bytes to Z80 | `/dev/axis_fifo_7c450000` → AXI FIFO → axis_byte_bridge → `io_rx_*` → Z80 `IN` |
 | bf2_ctrl / axi_fifo_mm_s / axis_byte_bridge stay as-is | Only the CPU IP instance changes |
-| BRAM resource usage ≤ bf2_soc (10 BRAM36) | Target: 2 BRAM36 = 8 KB ROM + 8 KB RAM (expandable) |
+| BRAM resource usage ≤ bf2_soc (10 BRAM36) | 16 BRAM36E1 = 8 KB ROM + 56 KB RAM |
 
 ### Data flow
 
@@ -38,7 +38,7 @@ flowchart TB
             WBUS["wb_tv80<br/>(tv80s)"]
             ADEC["Address Decoder"]
             ROM["ROM (8K BRAM)<br/>0x0000-0x1FFF"]
-            RAM["RAM (8K BRAM)<br/>0x2000-0xFFFF"]
+            RAM["RAM (56K BRAM)<br/>0x2000-0xFFFF"]
             IOBR["I/O → byte bridge"]
             BRCTRL["Dual-port BRAM control<br/>ctrl_gp1→RAM, ctrl_gp2→ROM<br/>gpX[24]=wr, [25]=rd, [23:16]=data"]
         end
@@ -72,7 +72,7 @@ flowchart TB
 | Range | Size | Type | Access | Contents |
 |---|---|---|---|---|
 | `0x0000` – `0x1FFF` | 8 KB | ROM (BRAM) | Read-only (Z80) / R/W (PS via gp2) | Bootstrap/monitor, loaded by PS |
-| `0x2000` – `0x3FFF` | 8 KB | RAM (BRAM) | R/W (Z80 + PS via gp1) | Program code + data (expandable) |
+| `0x2000` – `0xFFFF` | 56 KB | RAM (BRAM) | R/W (Z80 + PS via gp1) | Program code + data |
 | I/O space (any port) | — | I/O bridge | Z80 IN/OUT → byte handshake | PS ↔ Z80 byte stream |
 
 ### Z80 I/O → axis_byte_bridge mapping
@@ -96,10 +96,10 @@ is not ready (backpressure propagates naturally).
 
 | Metric | bf2_soc | z80_soc (Phase 1) | Delta |
 |---|---|---|---|
-| Code/ROM | 8 KB (1× BRAM36) | 8 KB (1× BRAM36) | Same |
-| Data/RAM | 32 KB (2× BRAM36) | 8 KB (1× BRAM36) | **−1 BRAM36** (expand to 56K later) |
-| Total BRAM36 | 3 (for storage) | **2** (8K ROM + 8K RAM) | **−8 BRAM36 vs bf2_soc total** |
-| Z80 addressable | N/A (bf2 ad-hoc) | Full 64 KB via Wishbone | Simpler addressing |
+| Code/ROM | 8 KB (1× BRAM36) | 8 KB (2× BRAM36E1) | +1 BRAM36E1 |
+| Data/RAM | 32 KB (2× BRAM36) | 56 KB (14× BRAM36E1) | +24 KB storage |
+| Total BRAM36E1 (z80_soc) | 3 (bf2 storage) | **16** (8K ROM + 56K RAM) | Uses 6 more BRAM36E1 than bf2_soc's 10 total |
+| Z80 addressable | N/A (bf2 ad-hoc) | Full 56 KB RAM at 0x2000–0xFFFF | Standard Wishbone bus |
 
 ### Wishbone interconnect
 
@@ -140,7 +140,7 @@ All registers are accessed through the existing `bf2_ctrl` (axi_gpreg at `0x7C44
 
 | Bit | Name | Function |
 |---|---|---|
-| 14:0 | `addr` | RAM address (supports up to 32K words) |
+| 15:0 | `addr` | Zero-based RAM offset (0x0000–0xDFFF maps to Z80 0x2000–0xFFFF) |
 | 23:16 | `wdata` | Write data byte |
 | 24 | `wr_strobe` | Rising edge: write `wdata` to `ram[addr]` |
 | 25 | `rd_strobe` | Rising edge: read `ram[addr]` → `ctrl_gp1_in[7:0]` |
@@ -150,7 +150,7 @@ All registers are accessed through the existing `bf2_ctrl` (axi_gpreg at `0x7C44
 
 | Bit | Name | Function |
 |---|---|---|
-| 14:0 | `addr` | ROM address |
+| 15:0 | `addr` | ROM address (0x0000–0x1FFF is valid) |
 | 23:16 | `wdata` | Write data byte (ROM is writable by PS for bootstrap loading) |
 | 24 | `wr_strobe` | Rising edge: write `wdata` to `rom[addr]` |
 | 25 | `rd_strobe` | Rising edge: read `rom[addr]` → `ctrl_gp2_in[7:0]` |
@@ -236,10 +236,10 @@ required, options are:
 |---|---|---|---|
 | 1. RTL lint | Verilator `--lint-only` | `make lint` in z80_soc | ✅ Pass (benign legacy warnings only) |
 | 2. Vivado IP pack | `make` in `hdl/library/z80_soc/` | `component.xml` generated | ✅ OK |
-| 3. Bitstream build | `make` in `hdl/projects/ebaz4205/` | Place & route, bitstream | ✅ Bitstream generated (timing marginal) |
-| 4. On-board — PS loads program | Python script writes Z80 test program to RAM via gpreg | Verify via debug outputs | ⏳ Pending |
-| 5. On-board — Z80 runs, PS reads output | Z80 loops `OUT (0), A` with incrementing byte | `cat /dev/axis_fifo_7c450000` shows 0x00, 0x01, 0x02... | ⏳ Pending |
-| 6. On-board — bidirectional | Z80 echo: `IN` then `OUT` same byte | Python sends bytes, reads back same bytes | ⏳ Pending |
+| 3. Bitstream build | `make` in `hdl/projects/ebaz4205/` | Place & route, bitstream | ✅ 80 MHz build; WNS +0.671 ns, 0 failing endpoints |
+| 4. On-board — PS loads program | Python script writes Z80 test program to RAM via gpreg | RAM readback and CPU memory-write smoke test | ✅ Pass |
+| 5. On-board — Z80 runs, PS reads output | Z80 loops `OUT (0), A` with incrementing byte | FIFO output is exactly `00 01 02 ...` without duplicates | ✅ Pass |
+| 6. On-board — bidirectional | Z80 echo: `IN` then `OUT` same byte | Python sends `abc`, reads back `abc` | ✅ Pass |
 
 ### Bring-up program (Z80 assembly)
 
@@ -383,16 +383,16 @@ For text overlay, two sub-options:
 | tv80 core (tv80s) | ~400 | ~300 | 0 | 0 | Approximate, similar to wb_z80's 315/396 |
 | wb_tv80 bridge | ~50 | ~40 | 0 | 0 | Simple combinatorial + register wrapper |
 | Address decoder | ~20 | ~10 | 0 | 0 | Small combinational decode |
-| ROM (8 KB) | 0 | 0 | 1 | 0 | 8K×8 BRAM |
-| RAM (8 KB) | 0 | 0 | 1 | 0 | 8K×8 BRAM |
+| ROM (8 KB) | 0 | 0 | 2 | 0 | 8K×8 BRAM (2× BRAM36E1) |
+| RAM (56 KB) | 0 | 0 | 14 | 0 | 56K×8 BRAM (14× BRAM36E1) |
 | I/O bridge | ~20 | ~20 | 0 | 0 | IN/OUT decode + sync |
 | Control logic + gpreg | ~100 | ~100 | 0 | 0 | Edge detect, status mux |
-| **z80_soc total** | **~590** | **~470** | **2** | **0** | **vs bf2_soc: 315/396/10** |
+| **z80_soc total** | **~590** | **~470** | **4** | **0** | **vs bf2_soc: 315/396/10** |
 | HDMI text overlay (future) | ~200 | ~150 | 2 | 0 | Text buffer + font ROM |
 | PS/2 keyboard (future) | ~150 | ~100 | 0 | 0 | Async receiver + FIFO |
 
-Phase 1 z80_soc uses **2 BRAM36** vs bf2_soc's **10 BRAM36** — a significant
-saving that leaves room for text framebuffer, font ROM, and keyboard FIFO later.
+Phase 1 z80_soc uses **16 BRAM36E1** for its full 8 KB ROM + 56 KB RAM map. This is six more BRAM36E1 than bf2_soc's 10, but provides the complete Z80 memory address space without aliasing.
+that leaves room for text framebuffer, font ROM, and keyboard FIFO later.
 
 ---
 

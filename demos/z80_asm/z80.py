@@ -14,6 +14,11 @@ Typical usage (from repo root):
   # Run pre-assembled binary
   python3 demos/z80_asm/z80.py run demos/z80_asm/bin/counter.bin -n 64
 
+  # Load separate ROM and RAM images
+  python3 demos/z80_asm/z80.py run \
+      --rom rom.s --rom-org 0x0100 \
+      --ram app.s --ram-org 0x2000
+
   # Assemble only
   python3 demos/z80_asm/z80.py assemble demos/z80_asm/src/counter.s -o /tmp/counter.bin
 
@@ -131,65 +136,71 @@ def cmd_assemble(args):
     run_cmd(asm_args, quiet=args.quiet)
 
 
-def cmd_run(args):
-    """Run a .bin or .s file on the board."""
-    source_path = Path(args.source)
+def prepare_binary(source: str, org: int, quiet: bool) -> bytes:
+    """Read a binary or assemble a source at the requested Z80 origin."""
+    source_path = Path(source)
     if not source_path.exists():
         die(f"File not found: {source_path}")
+    if source_path.suffix.lower() not in (".s", ".asm", ".z80"):
+        return source_path.read_bytes()
+    if not ASSEMBLER.exists():
+        die(f"Assembler script not found: {ASSEMBLER}")
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+        tmp_bin = tf.name
+    try:
+        run_cmd([
+            sys.executable, str(ASSEMBLER), str(source_path),
+            "-o", tmp_bin, "--org", hex(org),
+        ], quiet=quiet)
+        return Path(tmp_bin).read_bytes()
+    finally:
+        Path(tmp_bin).unlink(missing_ok=True)
 
-    # Determine if we need to assemble first
-    is_source = source_path.suffix.lower() in (".s", ".asm", ".z80")
-    binary_data: bytes | None = None
 
-    if is_source:
-        if not ASSEMBLER.exists():
-            die(f"Assembler script not found: {ASSEMBLER}")
-        # Assemble to temp file
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
-            tmp_bin = tf.name
-        try:
-            asm_args = [
-                sys.executable, str(ASSEMBLER),
-                str(source_path),
-                "-o", tmp_bin,
-            ]
-            if hasattr(args, 'org') and args.org is not None:
-                asm_args.extend(["--org", hex(args.org)])
-            run_cmd(asm_args, quiet=args.quiet)
-            binary_data = Path(tmp_bin).read_bytes()
-        finally:
-            Path(tmp_bin).unlink(missing_ok=True)
+def cmd_run(args):
+    """Load optional ROM and RAM images, then run on the board."""
+    if args.run_from_rom:
+        if not args.source or args.ram_source or args.rom_source:
+            die("--run-from-rom requires only the positional source")
+        rom_org = args.org if args.org is not None else (
+            args.rom_org if args.rom_org is not None else 0x0100)
+        rom_data = prepare_binary(args.source, rom_org, args.quiet)
+        ram_data = None
     else:
-        binary_data = source_path.read_bytes()
+        if args.source and args.ram_source:
+            die("specify RAM input either positionally or with --ram, not both")
+        ram_source = args.ram_source or args.source
+        rom_data = (prepare_binary(args.rom_source, args.rom_org or 0, args.quiet)
+                    if args.rom_source else None)
+        ram_data = (prepare_binary(ram_source, args.org if args.org is not None
+                                   else args.ram_org, args.quiet)
+                    if ram_source else None)
+        rom_org = args.rom_org
 
-    assert binary_data is not None
+    if ram_data is None and rom_data is None:
+        die("provide a RAM source and/or a ROM source")
 
-    # Upload runner + binary to board
     remote_dir = args.remote_dir or DEFAULT_REMOTE_DIR
     host = args.host or DEFAULT_HOST
 
-    # Create remote dir and upload files
-    run_cmd([
-        "ssh", host,
-        f"mkdir -p {remote_dir}",
-    ], quiet=args.quiet)
+    run_cmd(["ssh", host, f"mkdir -p {remote_dir}"], quiet=args.quiet)
 
-    # Upload the runner script
     with open(BOARD_RUNNER, "rb") as f:
         runner_data = f.read()
     run_cmd([
-        "ssh", host,
-        f"cat > {remote_dir}/run_z80.py",
+        "ssh", host, f"cat > {remote_dir}/run_z80.py",
     ], input_bytes=runner_data, quiet=args.quiet, check=True)
 
-    # Upload the binary
-    bin_name = f"program_{sha256_hex(binary_data)[:8]}.bin"
-    run_cmd([
-        "ssh", host,
-        f"cat > {remote_dir}/{bin_name}",
-    ], input_bytes=binary_data, quiet=args.quiet, check=True)
+    uploaded = {}
+    for kind, data in (("ram", ram_data), ("rom", rom_data)):
+        if data is None:
+            continue
+        name = f"{kind}_{sha256_hex(data)[:8]}.bin"
+        run_cmd([
+            "ssh", host, f"cat > {remote_dir}/{name}",
+        ], input_bytes=data, quiet=args.quiet, check=True)
+        uploaded[kind] = name
 
-    # Build command-line for the board
     board_args = []
     if args.interactive:
         board_args.append("-i")
@@ -206,14 +217,24 @@ def cmd_run(args):
     if args.no_boot_rom:
         board_args.append("--no-boot-rom")
 
-    board_cmd = (
-        f"cd {remote_dir} && "
-        f"python3 run_z80.py {bin_name} " + " ".join(shlex.quote(a) for a in board_args)
-    )
+    if args.run_from_rom:
+        board_args.extend(["--run-from-rom", "--rom-org", hex(rom_org)])
+        image_args = [uploaded["rom"]]
+    else:
+        image_args = []
+        if "ram" in uploaded:
+            image_args.extend(["--ram-image", uploaded["ram"],
+                                "--ram-org", hex(args.ram_org)])
+        if "rom" in uploaded:
+            image_args.extend(["--rom-image", uploaded["rom"]])
+            if args.rom_org is not None:
+                image_args.extend(["--rom-org", hex(args.rom_org)])
 
-    # Run on board
-    code = ssh_cmd(host, board_cmd, quiet=args.quiet, tty=args.interactive)
-    return code
+    board_cmd = (
+        f"cd {remote_dir} && python3 run_z80.py "
+        + " ".join(shlex.quote(a) for a in image_args + board_args)
+    )
+    return ssh_cmd(host, board_cmd, quiet=args.quiet, tty=args.interactive)
 
 
 def cmd_sim(args):
@@ -267,7 +288,7 @@ def main():
 
     # Default action: "run" when a positional is given
     run_p = sub.add_parser("run", help="Assemble (if .s) and run on board")
-    run_p.add_argument("source", help=".s source or .bin binary")
+    run_p.add_argument("source", nargs="?", help="Legacy RAM source or binary")
     run_p.add_argument("-i", "--interactive", action="store_true",
                        help="Live console")
     run_p.add_argument("-n", "--max-bytes", type=int,
@@ -278,8 +299,18 @@ def main():
     run_p.add_argument("-o", "--output", help="Save output to FILE")
     run_p.add_argument("--no-boot-rom", action="store_true",
                        help="Skip writing boot ROM")
+    run_p.add_argument("--run-from-rom", action="store_true",
+                       help="Legacy ROM-only mode")
+    run_p.add_argument("--ram", dest="ram_source",
+                       help="RAM source or binary (can be combined with --rom)")
+    run_p.add_argument("--ram-org", type=lambda x: int(x, 0), default=0x2000,
+                       help="RAM image Z80 address (default: 0x2000)")
+    run_p.add_argument("--rom", dest="rom_source",
+                       help="ROM source or binary (can be combined with --ram)")
+    run_p.add_argument("--rom-org", type=lambda x: int(x, 0), default=None,
+                       help="ROM image Z80 address; nonzero generates JP at 0x0000")
     run_p.add_argument("--org", type=lambda x: int(x, 0), default=None,
-                       help="Origin address override")
+                       help="Legacy positional-source origin override")
 
     ass_p = sub.add_parser("assemble", help="Assemble .s → .bin")
     ass_p.add_argument("source", help=".s source")
@@ -303,6 +334,11 @@ def main():
         args.input = None
         args.output = None
         args.no_boot_rom = False
+        args.run_from_rom = False
+        args.ram_source = None
+        args.ram_org = 0x2000
+        args.rom_source = None
+        args.rom_org = None
         args.org = None
 
     if args.action is None and not extra:
