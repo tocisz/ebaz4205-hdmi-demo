@@ -1074,6 +1074,26 @@ mkdir -p /sys/kernel/config/device-tree/overlays/pl
 cat /mnt/new_overlay.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
 ```
 
+For the normal project bitstream, `scripts/ebaz_deploy.sh` automates this
+sequence without rebooting:
+
+```bash
+# Build only the bitstream, copy it to /mnt, reprogram the PL, and restore
+# the existing PL overlay. The Ethernet/SSH connection stays up.
+./scripts/ebaz_deploy.sh --bitstream-only
+
+# Use the already-staged build_sdimg/system_top.bit.bin instead of building.
+./scripts/ebaz_deploy.sh --bitstream-only --skip-build root@192.168.1.203
+```
+
+This is a **full** PL reconfiguration, not partial reconfiguration. The script
+only deploys `system_top.bit.bin`; it does not copy boot files, kernel modules,
+or reboot the board. It removes the active `pl` overlay before programming so
+Linux unbinds PL drivers, then reapplies `/mnt/pl-ebaz4205.dtbo`. The overlay
+must match the bitstream, and userspace must not hold a PL device open when the
+overlay is removed. If the operation fails after overlay removal, SSH should
+remain available; reapply the overlay manually after correcting the problem.
+
 > **See [doc/FPGA_RECONFIGURATION.md](FPGA_RECONFIGURATION.md)** for full details:
 > kernel config verification, PHY clock analysis, DT overlay flow, PR concepts,
 > learning resources, and a prioritized improvement plan.

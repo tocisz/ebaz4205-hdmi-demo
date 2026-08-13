@@ -132,6 +132,24 @@ cat /mnt/new_overlay.dtbo > /sys/kernel/config/device-tree/overlays/pl/dtbo
 No need to unbind `macb`, no dropped SSH session, no UART console required.
 The kernel tracks the overlay lifecycle, so removal/re-application is clean.
 
+For the normal project bitstream, the repository script automates the same
+sequence and redeploys only the bitstream:
+
+```bash
+# Build only build/system_top.bit.bin, copy it to /mnt, activate it, and
+# restore the existing /mnt/pl-ebaz4205.dtbo overlay. No reboot occurs.
+./scripts/ebaz_deploy.sh --bitstream-only
+
+# Use the already-staged build_sdimg/system_top.bit.bin instead of building.
+./scripts/ebaz_deploy.sh --bitstream-only --skip-build root@192.168.1.203
+```
+
+The script performs a **full** PL reconfiguration, not partial reconfiguration.
+It does not copy boot files or kernel modules. The overlay must match the
+bitstream, and userspace must not hold a PL device open while the script removes
+the active overlay. If the command fails after overlay removal, SSH should stay
+available; correct the problem and reapply the overlay manually.
+
 ---
 
 ## Device Tree Overlay Flow (Conceptual)

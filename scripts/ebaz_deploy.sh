@@ -5,6 +5,8 @@
 #   ./scripts/ebaz_deploy.sh                # make sdimg + live-update ${EBAZ_HOST:-ebaz}
 #   ./scripts/ebaz_deploy.sh --skip-build   # deploy existing build_sdimg/ artifacts
 #   ./scripts/ebaz_deploy.sh --no-modules   # skip the /lib/modules sync (pure HDL cycle)
+#   ./scripts/ebaz_deploy.sh --bitstream-only              # build + full PL reload, no reboot
+#   ./scripts/ebaz_deploy.sh --bitstream-only --skip-build # reload build_sdimg bitstream only
 #   ./scripts/ebaz_deploy.sh root@192.168.1.203
 #
 # Live update (default) never touches SD partition 2 (the rootfs):
@@ -27,13 +29,15 @@ set -euo pipefail
 HOST="${EBAZ_HOST:-ebaz}"
 SKIP_BUILD=0
 SYNC_MODULES=1
+BITSTREAM_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
     --skip-build) SKIP_BUILD=1 ;;
     --no-modules) SYNC_MODULES=0 ;;
+    --bitstream-only) BITSTREAM_ONLY=1 ;;
     -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//'
+      grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -*) echo "unknown option: $arg" >&2; exit 1 ;;
@@ -47,6 +51,70 @@ SDIMG="$ROOT/build_sdimg"
 MODSRC="$ROOT/buildroot/output/target/lib/modules"
 
 FILES=(BOOT.bin boot.scr devicetree.dtb pl-ebaz4205.dtbo system_top.bit.bin uImage)  # boot partition (/mnt/)
+
+# A bitstream-only deployment is a full PL reconfiguration, not a reboot and
+# not partial reconfiguration.  The active configfs overlay is removed first
+# so Linux unbinds its PL drivers, then restored after fpgautil programs the
+# FPGA.  The dedicated Ethernet PHY oscillator keeps SSH alive throughout.
+if [ "$BITSTREAM_ONLY" -eq 1 ]; then
+  if [ "$SKIP_BUILD" -eq 0 ]; then
+    echo "==> make build/system_top.bit.bin ..."
+    (cd "$ROOT" && make build/system_top.bit.bin)
+    BITSTREAM="$ROOT/build/system_top.bit.bin"
+  else
+    BITSTREAM="$SDIMG/system_top.bit.bin"
+    if [ ! -f "$BITSTREAM" ]; then
+      BITSTREAM="$ROOT/build/system_top.bit.bin"
+    fi
+  fi
+
+  [ -f "$BITSTREAM" ] || {
+    echo "missing bitstream ($BITSTREAM) -- run without --skip-build" >&2
+    exit 1
+  }
+  echo "    bitstream: $BITSTREAM ($(du -h "$BITSTREAM" | cut -f1))"
+
+  echo "==> Checking board $HOST is online ..."
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" 'echo "    board ok: $(uname -n) $(uname -r)"' || {
+    echo "board $HOST not reachable before deploy" >&2
+    exit 1
+  }
+
+  echo "==> Copying bitstream to $HOST:/mnt/system_top.bit.bin ..."
+  scp -O -o ConnectTimeout=10 "$BITSTREAM" "$HOST":/mnt/system_top.bit.bin
+
+  echo "==> Reprogramming PL and reapplying the device-tree overlay (no reboot) ..."
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" '
+    set -eu
+    OVERLAY_DIR=/sys/kernel/config/device-tree/overlays/pl
+    OVERLAY_FILE=/mnt/pl-ebaz4205.dtbo
+    BITSTREAM=/mnt/system_top.bit.bin
+
+    if [ -d "$OVERLAY_DIR" ]; then
+      echo "    removing active PL overlay ..."
+      if ! rmdir "$OVERLAY_DIR"; then
+        echo "cannot remove $OVERLAY_DIR; close users of PL devices and retry" >&2
+        exit 1
+      fi
+    fi
+
+    echo "    programming full bitstream ..."
+    fpgautil -b "$BITSTREAM" -f Full
+
+    echo "    applying PL overlay ..."
+    mkdir -p "$OVERLAY_DIR"
+    if ! cat "$OVERLAY_FILE" > "$OVERLAY_DIR/dtbo"; then
+      rmdir "$OVERLAY_DIR" 2>/dev/null || true
+      echo "cannot apply $OVERLAY_FILE" >&2
+      exit 1
+    fi
+    sync
+    echo "    FPGA state: $(cat /sys/class/fpga_manager/fpga0/state 2>/dev/null || echo unknown)"
+  '
+
+  echo "==> Done. Bitstream is active; the board was not rebooted."
+  exit 0
+fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   echo "==> make sdimg ..."

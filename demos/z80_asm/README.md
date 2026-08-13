@@ -90,11 +90,13 @@ python3 demos/z80_asm/z80.py sim bin/counter.bin
 
 | Program | Source | Expected output | Notes |
 |---|---|---|---|
-| Counter | `src/counter.s` | `00 01 02 03 … FF 00 01 …` | Infinite loop |
-| Echo | `src/echo.s` | Echoes back any byte sent | Interactive |
-| Walk | `src/walk.s` | Pattern 00–FF written to RAM, then output | Infinite loop |
+| Counter | `src/counter.s` | `00 01 02 03 … FF 00 01 …` | Uses raw I/O bridge (any port) |
+| Echo | `src/echo.s` | Echoes back any byte sent | Interactive, raw I/O |
+| Walk | `src/walk.s` | Pattern 00–FF written to RAM, then output | Raw I/O |
 | Memtest | `src/memtest.s` | Full RAM test; outputs error count and pass/fail | Run from ROM |
 | Boot | `src/boot.s` | `jp 0x2000` (3 bytes) | ROM bootstrap |
+| ACIA Echo | `src/acia_echo.s` | Echoes back any byte sent via ACIA | Interactive, polled ACIA protocol |
+| ACIA Counter | `src/acia_counter.s` | `00 01 02 03 … FF 00 01 …` via ACIA | ACIA TDRE- gated output |
 
 ## Architecture
 
@@ -104,7 +106,41 @@ SoC. The PS (ARM A9) communicates with the Z80 through:
 - **`ctrl_gp0`** (axi_gpreg @0x7C440000): CPU control — halt, run, step, reset
 - **`ctrl_gp1`** (axi_gpreg @0x7C440044): RAM access (56 KB, Z80 address 0x2000-0xFFFF; GP address is a zero-based offset)
 - **`ctrl_gp2`** (axi_gpreg @0x7C440084): ROM access (8 KB, Z80 address 0x0000-0x1FFF)
-- **`/dev/axis_fifo_0x7c450000`**: byte stream I/O (Z80 `IN`/`OUT` port 0)
+- **`/dev/axis_fifo_0x7c450000`**: byte stream I/O — shared between the raw bridge (any port except 0x80-0x81) and the MC68B50 ACIA (ports 0x80-0x81)
+
+### Z80 I/O port map
+
+| Port(s) | Peripheral | Protocol |
+|---|---|---|
+| Any except 0x80-0x81 | Raw byte bridge | IN/OUT pass-through to FIFO (original behaviour) |
+| 0x80 | ACIA Control (write) / Status (read) | MC68B50 register protocol |
+| 0x81 | ACIA Data (write/read) | MC68B50 byte transfer |
+
+### MC68B50 ACIA protocol
+
+The FPGA implements an MC68B50-compatible ACIA on I/O ports 0x80-0x81.
+The Z80 firmware must follow the polled protocol:
+
+1. **Initialise**: Write control register (port 0x80) with non-reset value
+   (e.g. `0x17` = ÷1 clock, 8 bits, 1 stop bit, RTS low, no IRQ)
+2. **Transmit**: Poll status until TDRE (bit 1) = 1, then write data reg (port 0x81)
+3. **Receive**: Poll status until RDRF (bit 0) = 1, then read data reg (port 0x81)
+
+Status register format:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | RDRF | Receive data register full |
+| 1 | TDRE | Transmit data register empty |
+| 2 | DCD | Data carrier detect (tied to 0) |
+| 3 | CTS | Clear to send (tied to 0) |
+| 4 | FE | Framing error (always 0 in FIFO mode) |
+| 5 | OVRN | Overrun (byte lost when RDRF was still set) |
+| 6 | PE | Parity error (always 0 in FIFO mode) |
+| 7 | IRQ | Interrupt request (1 when enabled IRQ pending) |
+
+The ACIA shares the AXI-Stream FIFO with the raw bridge.  Only one consumer
+is active per Z80 I/O cycle, so both paths coexist without conflict.
 
 ### Register protocol
 
