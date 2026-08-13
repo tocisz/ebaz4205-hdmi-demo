@@ -96,7 +96,9 @@ python3 demos/z80_asm/z80.py sim bin/counter.bin
 | Memtest | `src/memtest.s` | Full RAM test; outputs error count and pass/fail | Run from ROM |
 | Boot | `src/boot.s` | `jp 0x2000` (3 bytes) | ROM bootstrap |
 | ACIA Echo | `src/acia_echo.s` | Echoes back any byte sent via ACIA | Interactive, polled ACIA protocol |
-| ACIA Counter | `src/acia_counter.s` | `00 01 02 03 … FF 00 01 …` via ACIA | ACIA TDRE- gated output |
+| ACIA Counter | `src/acia_counter.s` | `00 01 02 03 … FF 00 01 …` via ACIA | ACIA TDRE-gated output |
+| ACIA IRQ Test | `src/acia_irq_test.s` + `bin/acia_irq_rom.bin` | Echoes an input byte via an IM 1 ACIA ISR | RX data is consumed explicitly by the ISR |
+| RC2014 NASCOM ROM | `~/repos/z80/RC2014-nascom/rom.bin` | NASCOM BASIC with buffered serial I/O | IM 1 ACIA interrupts; load as a ROM image |
 
 ## Architecture
 
@@ -119,12 +121,17 @@ SoC. The PS (ARM A9) communicates with the Z80 through:
 ### MC68B50 ACIA protocol
 
 The FPGA implements an MC68B50-compatible ACIA on I/O ports 0x80-0x81.
-The Z80 firmware must follow the polled protocol:
+The Z80 firmware may use either the polled protocol or maskable interrupts:
 
 1. **Initialise**: Write control register (port 0x80) with non-reset value
    (e.g. `0x17` = ÷1 clock, 8 bits, 1 stop bit, RTS low, no IRQ)
 2. **Transmit**: Poll status until TDRE (bit 1) = 1, then write data reg (port 0x81)
 3. **Receive**: Poll status until RDRF (bit 0) = 1, then read data reg (port 0x81)
+4. **Interrupt mode**: Set CR[7] to enable receive IRQs and/or CR[6:5] to
+   `01` to enable transmit-empty IRQs, then use `IM 1` and `EI`.  The SoC
+   connects the ACIA IRQ to the TV80 INT input; IM 1 acknowledges vector
+   `RST 38h` at ROM address `0x0038`.  RX data remains in the shared bridge
+   until the ISR explicitly reads port `0x81` (there is no RX prefetch).
 
 Status register format:
 
@@ -140,7 +147,28 @@ Status register format:
 | 7 | IRQ | Interrupt request (1 when enabled IRQ pending) |
 
 The ACIA shares the AXI-Stream FIFO with the raw bridge.  Only one consumer
-is active per Z80 I/O cycle, so both paths coexist without conflict.
+is active per Z80 I/O cycle, so both paths coexist without conflict.  Interrupt
+acknowledge cycles are handled internally by the Z80 wrapper and are not
+mistaken for raw FIFO reads.
+
+### Interrupt test
+
+Build the split RAM/ROM images, then send one byte through the ACIA:
+
+```bash
+python3 demos/z80_asm/assemble_z80.py \
+    demos/z80_asm/src/acia_irq_test.s \
+    --org 0x2000 -o demos/z80_asm/bin/acia_irq_test.bin
+python3 demos/z80_asm/make_acia_irq_rom.py
+python3 demos/z80_asm/z80.py run \
+    --rom demos/z80_asm/bin/acia_irq_rom.bin \
+    --ram demos/z80_asm/bin/acia_irq_test.bin --ram-org 0x2000 \
+    --input Z -n 1
+```
+
+Expected output is one byte, `5a` (the echoed `Z`).  The ROM image contains
+`JP 0x2000` at reset and the IM 1 handler at `0x0038`; the RAM source only
+contains the ACIA setup and `HALT` loop.
 
 ### Register protocol
 
