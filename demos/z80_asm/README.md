@@ -18,14 +18,24 @@ Then on the board:
 ```bash
 ssh ebaz
 
-# Counter — outputs incrementing bytes
+# Control verbs — the CPU stays alive between invocations
+z80 status                       # halted / running
+z80 halt                         # pause the CPU
+z80 load ram counter.bin         # write image into RAM @ 0x2000 (Intel HEX or .bin)
+z80 dump ram 0x2000 64           # read RAM back as a hexdump
+z80 flush reset run              # discard FIFO, PC=0, start
+
+# Terminal
+z80 term                         # attach stdin/stdout to the Z80 I/O stream
+z80 term --flush                 # discard buffered output before attaching
+                                  # (Ctrl-] detaches; CPU keeps running)
+
+# One-liners — commands run left to right, 'term' must be last
+z80 halt load ram counter.bin flush reset run
+
+# Legacy one-shot (halts the CPU on exit; kept for scripts)
 z80 /root/z80-examples/counter.bin -n 64
-
-# Interactive echo — type characters, see them echoed back
 z80 /root/z80-examples/echo.bin -i
-
-# Memory walker — writes pattern to RAM, outputs via I/O
-z80 /root/z80-examples/walk.bin -n 256
 
 z80 --help
 ```
@@ -34,13 +44,14 @@ Installed files:
 
 | Path | Role |
 |------|------|
-| `/root/z80` | load + run tool |
+| `/root/z80` | board tool entry point |
+| `/root/z80_board/` | implementation package (`hw.py`, `images.py`, `cli.py`) |
 | `/root/z80-examples/` | sample `.bin` programs |
 
 ### From your PC
 
 ```bash
-# One command: assemble → deploy → run → print output
+# One command: assemble → deploy → run → print output (legacy one-shot)
 python3 demos/z80_asm/z80.py demos/z80_asm/src/counter.s -n 64
 
 # Interactive (allocates a TTY via ssh -t)
@@ -52,6 +63,15 @@ python3 demos/z80_asm/z80.py run \
     --rom demos/z80_asm/src/boot.s \
     --ram demos/z80_asm/src/counter.s --ram-org 0x2000 \
     -n 3
+
+# New-style: pass individual commands through to the board tool.
+# Local files are uploaded automatically; --host selects the board.
+python3 demos/z80_asm/z80.py status
+python3 demos/z80_asm/z80.py load ram demos/z80_asm/bin/counter.bin
+python3 demos/z80_asm/z80.py dump ram 0x2000 16
+python3 demos/z80_asm/z80.py board halt load ram app.hex flush reset run
+python3 demos/z80_asm/z80.py term --flush          # ssh -t is allocated
+python3 demos/z80_asm/z80.py term --no-flush       # explicit keep-buffer
 ```
 
 Environment overrides:
@@ -75,8 +95,27 @@ Requires `binutils-z80` (`apt install binutils-z80`).
 ### 2. Run on the board
 
 ```bash
-python3 demos/z80_asm/z80.py run src/counter.bin -n 64
+python3 demos/z80_asm/z80.py run src/counter.bin -n 64   # legacy one-shot
 python3 demos/z80_asm/z80.py run src/echo.bin -i
+
+# New-style session (CPU stays alive between commands)
+python3 demos/z80_asm/z80.py board halt load ram src/counter.bin flush reset run
+python3 demos/z80_asm/z80.py term
+```
+
+### Intel HEX loading
+
+`load` accepts both raw binaries and Intel HEX (as produced by
+`z80-unknown-coff-objcopy -O ihex`).  HEX records carry their own addresses,
+so a NASCOM image can be loaded straight into RAM (e.g. `.ram` at `0x8400`
+on the EBAZ memory map):
+
+```bash
+ssh ebaz
+z80 halt
+z80 load rom /tmp/rom_ebaz.bin      # binary, addresses from the linker script
+z80 load ram /tmp/hello.hex         # hex, addresses from the records
+z80 flush reset run term --no-flush
 ```
 
 ### 3. Simulate (view binary contents)
@@ -99,6 +138,25 @@ python3 demos/z80_asm/z80.py sim bin/counter.bin
 | ACIA Counter | `src/acia_counter.s` | `00 01 02 03 … FF 00 01 …` via ACIA | ACIA TDRE-gated output |
 | ACIA IRQ Test | `src/acia_irq_test.s` + `bin/acia_irq_rom.bin` | Echoes an input byte via an IM 1 ACIA ISR | RX data is consumed explicitly by the ISR |
 | RC2014 NASCOM ROM | `~/repos/z80/RC2014-nascom/rom.bin` | NASCOM BASIC with buffered serial I/O | IM 1 ACIA interrupts; load as a ROM image |
+
+## Unit tests (no board required)
+
+The board tool and image parsers run (and are tested) on the host without
+any FPGA access.  The hardware layer is replaced by an in-memory `MockBoard`
+whose state persists across invocations, exactly like the live FPGA does
+between `z80` commands.
+
+```bash
+./demos/z80_asm/run_z80_tests.sh
+# or from the repo root:
+python3 -m unittest discover -s demos/z80_asm/tests -t demos/z80_asm -v
+```
+
+Coverage: Intel HEX parsing (records, types 02/04, gaps, EOF, checksums),
+binary detection, chain splitting, `load`/`dump` handlers (boundaries,
+clipping, vector, fill, verify, force-halt, strict), and end-to-end `z80`
+invocations via `cli.main()` (state persistence, term-not-last rule, legacy
+compatibility, clean TTY error).
 
 ## Architecture
 
@@ -176,29 +234,53 @@ Same as bf2_soc — see `doc/Z80_SOC_PLAN.md` or `doc/AXIS_FIFO_BRIDGE.md`.
 
 ## Tips & pitfalls
 
-1. **Finite capture**: Infinite-loop programs need `-n N` or `--max-time SEC`.
-2. **Boot ROM**: Written once per FPGA boot. The runner checks and skips if present.
-3. **FIFO state between runs**: The AXI FIFO and bridge staging register are
-   independent of the Z80 ctrl reset. The runner resets both FIFO data paths,
-   then drains any remaining packets before starting a new program.
-4. **Interactive**: `ssh -t ebaz z80 echo.bin -i` (`-t` is required for TTY).
-   Quit with Ctrl-C or Ctrl-].
-5. **Image origins**: `--ram-org` is a Z80 address in `0x2000–0xFFFF`.
-   If `--rom-org` is omitted, the ROM image is loaded at `0x0000` unchanged
-   and must contain its own reset vector. If `--rom-org 0x100` is given,
-   the runner loads the image at `0x0100` and generates `jp 0x0100` at reset.
-6. **Out of RAM**: 56 KB limit. Assemble first to check binary size.
-7. **Stale board process**: Reset with `pkill -f "/root/z80|run_z80"; echo "done"`.
-8. **Memory map**: Legacy code loaded to RAM address `0x2000`; the boot ROM
-   contains `jp 0x2000` unless an explicit ROM image is supplied.
+1. **Finite capture** (legacy `run`): Infinite-loop programs need `-n N` or
+   `--max-time SEC`.
+2. **Load/dump require a halted CPU**: `z80 load ...` or `z80 dump ...` while
+   the CPU is running fail unless you add `--force-halt` (which halts first).
+3. **FIFO state between programs**: The AXI FIFO and bridge staging register
+   are independent of the Z80 ctrl reset. Use `z80 flush` to reset both FIFO
+   data paths and drain stale packets before a `reset run`.
+4. **Interactive**: `ssh -t ebaz z80 term` (`-t` is required for TTY).
+   Detach with Ctrl-]; the CPU keeps running. `term --flush` discards
+   buffered output first. Note: `flush` cannot clear a stale byte already
+   held in the ACIA RX register.
+5. **New-style `run` ≠ legacy `run`**: on the board, `z80 run` resumes the
+   CPU (no reset, no load). To restart from PC=0 use `z80 reset run`.
+   `z80 run FILE.bin [options]` is the legacy one-shot compatibility path
+   (halts the CPU on exit).
+6. **Image origins**: `--ram-org` is a Z80 address in `0x2000–0xFFFF` (legacy
+   flags; new-style `load ram FILE 0xADDR` takes the same address).
+   If `--rom-org` is omitted, a ROM image is loaded at `0x0000` unchanged and
+   must contain its own reset vector. `--rom-org 0x100` generates `jp 0x0100`
+   at reset; the new-style equivalent is `load rom FILE --vector 0x100`.
+7. **Intel HEX sparse loads**: only bytes listed in the file are written;
+   nothing is zeroed. Use `load ram FILE --fill 0x00` to clear the loaded
+   region first (mimics the old one-shot behaviour).
+8. **Out of RAM**: 56 KB limit (0x2000–0xFFFF). Assemble first to check size.
+9. **Load vs space**: if every segment of an image falls outside the target
+   space, `load` errors with “nothing was written” (warnings are printed for
+   each skipped/clipped segment first). Partial images warn and load the
+   in-range part.
+10. **Stale board process**: Reset with `pkill -f "/root/z80|run_z80"; echo "done"`.
+11. **Memory map**: Legacy code loads to RAM address `0x2000`; the boot ROM
+    contains `jp 0x2000` unless an explicit ROM image is supplied.
 
 ## Layout
 
 ```
 demos/z80_asm/
-  z80.py                 # host entry point (assemble / sim / run)
+  z80.py                 # host entry point (assemble / sim / run / passthrough)
   assemble_z80.py        # .s → .bin wrapper (uses binutils-z80)
-  run_z80_program.py     # on-board loader + I/O (installed as /root/z80)
+  run_z80_program.py     # on-board entry point (installed as /root/z80)
+  z80_board/             # board-side implementation package
+    hw.py                #   /dev/mem register access + FIFO helpers
+    images.py            #   Intel HEX / binary parsing, hexdump
+    cli.py               #   command dispatcher (halt/run/reset/load/dump/term/flush)
+  tests/                 # host-side unit tests (no board needed)
+    mock_board.py        #   in-memory board + run_main() harness
+    test_*.py            #   images / chain split / load-dump / dispatcher / host
+  run_z80_tests.sh       # unit test runner
   install_to_board.sh    # deploy tools + examples to the board
   src/                   # Z80 assembly sources
   bin/                   # pre-assembled binaries

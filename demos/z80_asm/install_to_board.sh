@@ -27,7 +27,12 @@ put() {
 echo "Installing Z80 tools to $HOST:/root ..."
 
 put "$HERE/run_z80_program.py" /root/z80
-ssh_cmd 'chmod 755 /root/z80'
+ssh_cmd 'chmod 755 /root/z80
+mkdir -p /root/z80_board'
+put "$HERE/z80_board/__init__.py" /root/z80_board/__init__.py
+put "$HERE/z80_board/hw.py"        /root/z80_board/hw.py
+put "$HERE/z80_board/images.py"    /root/z80_board/images.py
+put "$HERE/z80_board/cli.py"       /root/z80_board/cli.py
 
 # Pre-assemble binaries and upload them
 cd "$HERE"
@@ -53,25 +58,37 @@ put bin/boot.bin    /root/z80-examples/boot.bin
 # Symlink /root/z80 into PATH
 ssh_cmd 'ln -sfn /root/z80 /usr/bin/z80
 cat > /root/z80-examples/README.txt << "EOF"
-z80 — run Z80 programs on the FPGA CPU
+z80 — interactive control of the Z80 SoC on the FPGA
 
-  z80 counter.bin -n 64        # capture 64 bytes from counter
-  z80 echo.bin -i              # interactive echo (type, see result)
-  z80 walk.bin -n 256          # memory walking pattern
+The CPU stays alive between invocations.  Commands run left to right:
 
-  Quit interactive with Ctrl-C or Ctrl-].
-  From a PC:  ssh -t HOST z80 /root/z80-examples/echo.bin -i
+  z80 status                        # halted / running
+  z80 halt                          # pause the CPU
+  z80 load ram counter.bin          # write image into RAM @0x2000
+  z80 load rom boot.bin             # write image into ROM @0x0000
+  z80 dump ram 0x2000 64            # read back RAM as hex
+  z80 flush reset run               # discard FIFO, PC=0, start
+  z80 term                          # attach terminal (Ctrl-] to detach)
+  z80 term --flush                  # same, but discard buffered output first
+
+  One-liners:  z80 halt load ram counter.bin flush reset run
+               ssh -t HOST z80 term
+
+Legacy one-shot (halts CPU at end, kept for scripts):
+  z80 counter.bin -n 64
+  z80 echo.bin -i
 
   z80 --help
 
-Files: /root/z80  /root/z80-examples/
+Files: /root/z80  /root/z80_board/  /root/z80-examples/
 EOF
 ls -la /root/z80 /usr/bin/z80 /root/z80-examples/'
 
 echo
 echo "Done. On the board:"
 echo "  ssh $HOST"
-echo "  z80 /root/z80-examples/counter.bin -n 64"
-echo "  z80 /root/z80-examples/echo.bin -i"
-echo "  z80 /root/z80-examples/walk.bin -n 256"
-echo "From PC interactive: ssh -t $HOST z80 /root/z80-examples/echo.bin -i"
+echo "  z80 status"
+echo "  z80 halt load ram /root/z80-examples/counter.bin flush reset run"
+echo "  z80 term"
+echo "  z80 /root/z80-examples/counter.bin -n 64   (legacy one-shot)"
+echo "From PC: python3 demos/z80_asm/z80.py board halt load ram app.hex reset run"
