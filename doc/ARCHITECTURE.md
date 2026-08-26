@@ -83,7 +83,7 @@ The HDMI expansion board plugs into the FPGA I/O headers and provides a standard
 | Ethernet | RGMII via EMIO | Standard kernel netdev |
 | NAND flash | SMCC controller | MTD subsystem |
 | UART | UART0 (EMIO header), UART1 (MIO 24-25 USB) | Serial console |
-| PL TTY (UART) | AXI UART Lite (0x7C430000) → `uart_phy` → `bf2_soc` (PL) | `/dev/ttyUL1` (uartlite) |
+| PL TTY (UART) | *(historical, removed)* AXI UART Lite (0x7C430000) → `uart_phy` → `bf2_soc` → see `doc/PL_TTY_DEVICE.md` | `/dev/ttyUL1` *(removed; use FIFO `/dev/axis_fifo_0x7c450000`)* |
 
 > **Blinking LED**: The green expansion-board LED (`gpio_led_green`, GPIO0 pin 54 / EMIO bit 0, ball W13) blinks with the kernel's `heartbeat` trigger by default. It is the **only LED that blinks autonomously** — the kernel `gpio-leds` driver (with `CONFIG_LEDS_GPIO=y` and `CONFIG_LEDS_TRIGGER_HEARTBEAT=y`) picks up the `linux,default-trigger = "heartbeat"` from the device tree at boot. No HDL logic or userspace code is involved. The remaining LEDs (`gpio_led_red`, `gpio_led_aux_0/1/2` on GPIO 55-58) have `linux,default-state = "off"` and stay dark until explicitly controlled via `/sys/class/leds/`.
 
@@ -164,7 +164,7 @@ graph TB
         ddrctrl["DDR Controller"]
         hp0["AXI HP0 64-bit<br/>high-bandwidth"]
         gp0["AXI GP0 control"]
-        fclk["FCLK_CLK0 100 MHz"]
+        fclk["FCLK_CLK0 80 MHz"]
         frst["FCLK_RESET0"]
         irq["IRQ_F2P"]
     end
@@ -204,15 +204,15 @@ All IP instances and their connections, as defined in the Vivado block design:
 
 ```mermaid
 graph LR
-    PS7["sys_ps7<br/>Zynq PS7"] -->|FCLK_CLK0 100 MHz| RST["sys_rstgen<br/>Reset Sync"]
+    PS7["sys_ps7<br/>Zynq PS7"] -->|FCLK_CLK0 80 MHz| RST["sys_rstgen<br/>Reset Sync"]
     PS7 -->|FCLK_RESET0_N| RST
     RST -->|sys_cpu_reset / sys_cpu_resetn| PL
 
-    PS7 -->|100 MHz| DMA["hdmi_sink_dma<br/>AXI DMAC"]
-    PS7 -->|100 MHz| GEN["hdmi_generator_0<br/>PLL + AXI-S→RGB"]
-    PS7 -->|100 MHz| B2["bf2_soc_0"]
-    PS7 -->|100 MHz| BRIDGE["axis_byte_bridge_0"]
-    PS7 -->|100 MHz| FIFO["axi_fifo_mm_s_0<br/>AXI-Stream FIFO"]
+    PS7 -->|80 MHz| DMA["hdmi_sink_dma<br/>AXI DMAC"]
+    PS7 -->|80 MHz| GEN["hdmi_generator_0<br/>PLL + AXI-S→RGB"]
+    PS7 -->|80 MHz| B2["z80_soc_0<br/>Z80/tv80 + ACIA"]
+    PS7 -->|80 MHz| BRIDGE["axis_byte_bridge_0"]
+    PS7 -->|80 MHz| FIFO["axi_fifo_mm_s_0<br/>axi_fifo_lite (FIFO)"]
 
     PS7 ==>|64b AXI-MM via HP0| DMA
     PS7 -.->|AXI-Lite @ 0x7C420000| DMA
@@ -261,15 +261,15 @@ graph LR
 
 | Instance | IP Core | Address / IRQ | Role |
 |---|---|---|---|
-| `sys_ps7` | `processing_system7` | — | Zynq-7000 PS (ARM A9, DDR, peripherals, 100 MHz FCLK, reset, AXI HP0/GP0) |
+| `sys_ps7` | `processing_system7` | — | Zynq-7000 PS (ARM A9, DDR, peripherals, 80 MHz FCLK, reset, AXI HP0/GP0) |
 | `sys_rstgen` | `proc_sys_reset` | — | Synchronizes FCLK_RESET0_N → `sys_cpu_reset` / `sys_cpu_resetn` |
 | `sys_concat_intc` | `xlconcat` | 16→1 to IRQ_F2P | Interrupt combiner |
 | `hdmi_sink_dma` | `axi_dmac` | `0x7C420000` irq ps-12 | DMA: reads DDR via HP0, streams 64-bit to HDMI generator |
 | `hdmi_generator_0` | `hdmi_generator` | — | MMCM PLL (100→25/126 MHz) + AXI-Stream→RGB adapter |
 | `hdmi_0` | `hdmi` | — | TMDS 1.4b serializer → HDMI connector |
-| `bf2_soc_0` | `bf2_soc` | — | Brainfuck softcore CPU (byte-level I/O handshake) |
-| `bf2_ctrl` | `axi_gpreg` | `0x7C440000` | 3-bit control gpreg for bf2 run/step/reset |
-| `axi_fifo_mm_s_0` | `axi_fifo_mm_s` | `0x7C450000` irq ps-14 | Dual 32-bit AXI-Stream FIFO (PS↔PL) |
+| `z80_soc_0` | `z80_soc` (`tv80` + `acia68b50`) | — | Z80-compatible softcore (replaces `bf2_soc`); 8 KiB ROM `0x0000–0x1FFF`, 56 KiB RAM `0x2000–0xFFFF`, raw + ACIA `0x80/0x81` I/O |
+| `bf2_ctrl` | `axi_gpreg` | `0x7C440000` | 3-bit control gpreg for Z80 halt/run/step/reset (instance name kept for DT compat) |
+| `axi_fifo_mm_s_0` | `axi_fifo_lite` | `0x7C450000` irq ps-14 | AXI-Stream FIFO PS↔PL (behavioral drop-in for Xilinx `axi_fifo_mm_s`; fixes 1.9k-packet wedge — see `doc/Z80_FIFO_WEDGE_INVESTIGATION.md` §5b) |
 | `axis_byte_bridge_0` | `axis_byte_bridge` | — | 32-bit stream ↔ 8-bit byte handshake |
 | `audio_sample_word_GND` | `xlconstant` | — | 16-bit zero tie-off for unused HDMI audio |
 
@@ -281,12 +281,12 @@ Percentages are of the total available in the PL fabric.
 | Instance | LUTs | % LUT | FFs | % FF | BRAM36 | % BRAM | DSP | Notes |
 |---|---|---|---|---|---|---|---|---|
 | **System total** | **2800** | **15.9%** | **3103** | **8.8%** | **13** | **21.7%** | **0** | also 1 MMCM (50%), 4 BUFG (13%), 40 IOB (40%) |
-| `axi_fifo_mm_s_0` | 746 | 4.2% | 667 | 1.9% | 2 | 3.3% | 0 | AXI-Stream FIFO — largest LUT consumer |
+| `axi_fifo_mm_s_0` (`axi_fifo_lite`) | 746¹ | 4.2% | 667¹ | 1.9% | 2¹ | 3.3% | 0 | AXI-Stream FIFO — largest LUT consumer (¹ Xilinx IP; Lite is smaller) |
 | `axi_cpu_interconnect` | 543 | 3.1% | 676 | 1.9% | 0 | — | 0 | AXI interconnect + auto protocol converter |
 | `hdmi_sink_dma` | 429 | 2.4% | 565 | 1.6% | 1 | 1.7% | 0 | AXI DMAC — register map + transfer engine |
 | `hdmi_0` | 352 | 2.0% | 171 | 0.5% | 0 | — | 0 | TMDS 1.4b serializer (3 channels + packet assembler) |
-| `bf2_soc_0` | 315 | 1.8% | 396 | 1.1% | 10 | 16.7% | 0 | Brainfuck CPU — BRAM-heavy (10× RAMB36 for program/stack) |
-| `bf2_ctrl` | 216 | 1.2% | 539 | 1.5% | 0 | — | 0 | AXI gpreg — regfile-heavy control |
+| `z80_soc_0` (`bf2_soc_0` in older builds) | 315¹ | 1.8% | 396¹ | 1.1% | 10¹ | 16.7% | 0 | Softcore CPU — BRAM-heavy (10× RAMB36 for program/stack) ¹ bf2-era; re-measure after z80_soc + Lite rebuild |
+| `bf2_ctrl` (`axi_gpreg`) | 216 | 1.2% | 539 | 1.5% | 0 | — | 0 | AXI gpreg — regfile-heavy control |
 | `hdmi_generator_0` | 168 | 1.0% | 39 | 0.1% | 0 | — | 0 | PLL + LUTRAM double-buffer adapter |
 | `sys_rstgen` | 16 | 0.1% | 31 | 0.1% | 0 | — | 0 | Reset synchronizer |
 | `sys_ps7` | 14 | 0.1% | 10 | 0.0% | 0 | — | 0 | PS7 wrapper logic (EMIO fanout, IOBUF) |
@@ -321,15 +321,15 @@ This is the only custom hardware IP in the design. It serves two roles:
 **1. Clock generation** (`hdmi_generator.v`)
 ```verilog
 MMCME2_ADV #(
-    .CLKIN1_PERIOD(10.000),       // 100 MHz from PS7 FCLK_CLK0
-    .DIVCLK_DIVIDE(5),            // Pre-divider = ÷5
-    .CLKFBOUT_MULT_F(50.500),     // VCO = 100 MHz × 50.5 / 5 = 1010 MHz
+    .CLKIN1_PERIOD(12.500),       // 80 MHz from PS7 FCLK_CLK0
+    .DIVCLK_DIVIDE(4),            // Pre-divider = ÷4
+    .CLKFBOUT_MULT_F(50.500),     // VCO = 80 MHz × 50.5 / 4 = 1010 MHz
     .CLKOUT0_DIVIDE_F(40.000),    // pixel_clk = 1010 / 40 = 25.2 MHz
     .CLKOUT1_DIVIDE(8)            // ser_clk   = 1010 / 8  = 126 MHz (×5)
 ) mmcm_adv_inst;
 ```
 
-The PLL is tuned specifically for 640×480@60Hz (VIC 1), producing exactly 25.175 MHz → rounds to 25.2 MHz with a VCO frequency of 1010 MHz.
+The PLL is tuned specifically for 640×480@60Hz (VIC 1), producing exactly 25.175 MHz → rounds to 25.2 MHz with a VCO frequency of 1010 MHz. The MMCM was re-tuned when FCLK dropped from 100 MHz to 80 MHz (tv80 timing margin): `DIVCLK_DIVIDE` 5→4 and `CLKIN1_PERIOD` 10.0→12.5 ns keep the same VCO/pixel clocks.
 
 **2. AXI-Stream to RGB bridge** (`hdmi_adapter.v`)
 
@@ -345,7 +345,7 @@ The DMAC delivers 64-bit words on the pixel clock domain. Since each pixel is 24
 Eight 64-bit words = 512 bits = 21⅓ pixels
 ```
 
-The `hdmi_adapter` uses a **LUTRAM double-buffer** (3 × 64-bit entries) to reassemble full pixels from the misaligned 64-bit stream. One buffer is written by the AXI-Stream side (100 MHz domain), the other is read on the pixel clock side (25.2 MHz). They swap roles after each full buffer, achieving continuous throughput with zero cycle waste.
+The `hdmi_adapter` uses a **LUTRAM double-buffer** (3 × 64-bit entries) to reassemble full pixels from the misaligned 64-bit stream. One buffer is written by the AXI-Stream side (80 MHz domain), the other is read on the pixel clock side (25.2 MHz). They swap roles after each full buffer, achieving continuous throughput with zero cycle waste.
 
 **Underflow detection**:
 ```verilog
@@ -374,6 +374,15 @@ This is [Sameer Puri's open-source HDMI 1.4b transmitter](https://github.com/hdl
 **Modifications for this project**: The original module `hdmi.sv` was written in SystemVerilog. Vivado's IP packager handles SystemVerilog for sub-modules but not for the top-level module during packaging. The top was **converted from SystemVerilog to Verilog** (`hdmi.v`) and wrapped with a Vivado IP TCL script (`hdmi_ip.tcl`). All sub-modules remain in their original SystemVerilog.
 
 **Audio**: Both audio sample word inputs are tied to constant zero — no audio output. The design could be extended to support L-PCM audio over HDMI.
+
+#### Project IP (Z80 SoC path)
+
+| IP Core | Origin | Role |
+|---|---|---|
+| `z80_soc` | Project (`hdl/library/z80_soc`) — `tv80` + `acia68b50` | Z80-compatible SoC; see `doc/Z80_SOC_PLAN.md` |
+| `axis_byte_bridge` | Project (`hdl/library/axis_byte_bridge`) | 32-bit AXIS word ↔ 8-bit byte handshake (TLAST per word) |
+| `axi_fifo_lite` | Project (`hdl/library/axi_fifo_lite`) | Behavioral drop-in for Xilinx `axi_fifo_mm_s` (PG080); fixes 1.9k-packet wedge at `TLAST=1` / 1024 depth; same `0x7C450000` map/IRQ as `axis_fifo.ko` expects |
+| `axi_gpreg` (`bf2_ctrl`) | Analog Devices | 3×32-bit GP regs for halt/run/step/reset + ROM/RAM byte access |
 
 #### Third-party IP used as-is
 
@@ -484,17 +493,15 @@ mwipcore0: mwipcore@0 {
 
 Key detail: `mwipcore@0` has **no `reg` property** — this was a deliberate design choice. The MathWorks driver normally expects a register bank for IP control, but this design uses the ADI AXI DMAC directly as a pure streaming engine. A kernel patch (by the project author) was applied to allow the `mathworks,mwipcore` driver to work with no memory-mapped registers, making the info and TLAST channels conditional on `reg` being present.
 
-### PL TTY character device (UART)
+### PL TTY character device (UART) — historical (removed)
 
-Beyond the two PS UART consoles, the design exposes a third serial channel to
-Linux: `/dev/ttyUL1`, backed by a Xilinx **AXI UART Lite** core in the PL
-(0x7C430000, IRQ 57). Its serial `tx`/`rx` wires connect to the **`uart_phy`**
-PHY — the same module used by the `bf2_soc` softcore — so Linux drives the
-softcore's UART as if it were an external UART:
+> **Removed.** The AXI UART Lite path (`/dev/ttyUL1` at `0x7C430000` via `uart_phy` → `bf2_soc`) was replaced by the **AXI-Stream FIFO bridge** (`axis_byte_bridge` + `axi_fifo_lite` at `0x7C450000`). The current PS↔PL console is `z80 term` over `/dev/axis_fifo_0x7c450000` (see `doc/AXIS_FIFO_BRIDGE.md` and `doc/Z80_INTERACTIVE_TOOL.md`). The section below is retained as a historical record; see `doc/PL_TTY_DEVICE.md` for the full story.
+
+Historically the design exposed a third serial channel to Linux: `/dev/ttyUL1`, backed by a Xilinx **AXI UART Lite** core in the PL (0x7C430000, IRQ 57). Its serial `tx`/`rx` wires connected to the **`uart_phy`** PHY — the same module used by the `bf2_soc` softcore — so Linux drove the softcore's UART as if it were an external UART:
 
 ```mermaid
 graph LR
-    ps["Linux /dev/ttyUL1<br/>uartlite driver"]
+    ps["(historical) Linux /dev/ttyUL1<br/>uartlite driver"]
     ul["AXI UART Lite<br/>0x7C430000 / IRQ 57<br/>16-byte TX/RX FIFOs"]
     phy["uart_phy (PL)<br/>8N1, 115200"]
     soc["bf2_soc (PL softcore)<br/>parallel interface"]
@@ -509,9 +516,9 @@ own 16-byte TX FIFO is full — i.e. only at the wire baud rate (115200 ≈
 11.5 KB/s). The wire carries no RTS/CTS (AXI UART Lite has no modem pins), and
 `uart_phy` silently drops bytes when its 16-entry RX FIFO overflows, which the
 PS cannot detect. A long PS→PL stream while `bf2_soc` is not executing `,`
-therefore loses bytes silently. See [doc/PL_TTY_DEVICE.md](PL_TTY_DEVICE.md)
+therefore loses bytes silently. This limitation motivated the FIFO replacement. See [doc/PL_TTY_DEVICE.md](PL_TTY_DEVICE.md)
 for the full implementation and [doc/UART_PHY.md](UART_PHY.md) for the
-parallel-interface contract.
+parallel-interface contract. Current `z80_soc` I/O is via the FIFO: `z80_soc` ↔ `axis_byte_bridge` ↔ `axi_fifo_lite` ↔ `/dev/axis_fifo_0x7c450000` ( polled `TDRE` on ACIA `0x80/0x81` or raw ports; no baud-rate bottleneck).
 
 ### Kernel configuration highlights
 
@@ -531,13 +538,13 @@ CONFIG_OVERLAY_FS=y                 # For development
 ```mermaid
 graph TB
     ps["PS7 (Zynq PS)"] --> psclk["PS_CLK 33.33 MHz<br/>(from Ethernet PHY oscillator)"]
-    ps --> fclk0["FCLK_CLK0 100 MHz"]
+    ps --> fclk0["FCLK_CLK0 80 MHz"]
     ps --> fclk1["FCLK_CLK1 25 MHz<br/>(routed to FPGA pin for external use)"]
     psclk --> plls["Internal PLLs → CPU 667 MHz<br/>DDR clock, peripheral clocks"]
-    fclk0 --> sys_clk["sys_cpu_clk"]
+    fclk0 --> sys_clk["sys_cpu_clk (80 MHz)"]
     fclk0 --> dmac_clk["AXI DMAC<br/>(control + AXI-MM source)"]
     fclk0 --> rstgen["sys_rstgen"]
-    fclk0 --> mmcm["hdmi_generator (MMCM input)"]
+    fclk0 --> mmcm["hdmi_generator (MMCM input, 80 MHz → 25.2/126 MHz)"]
     mmcm --> pix_clk["pixel_clk = 25.2 MHz<br/>(÷40 from VCO)"]
     mmcm --> ser_clk["ser_clk = 126 MHz x5<br/>(÷8 from VCO)"]
     pix_clk --> adap_rd["hdmi_adapter (read side)"]
@@ -547,7 +554,7 @@ graph TB
 ```
 
 The clock architecture uses two separate domains:
-- **100 MHz system domain**: CPU, AXI buses, DMAC control interface, AXI-MM memory reads
+- **80 MHz system domain**: CPU, AXI buses, DMAC control interface, AXI-MM memory reads (lowered from 100 MHz for tv80 timing margin; HDMI MMCM DIVCLK 5→4, period 10.0→12.5 ns preserves pixel clocks)
 - **25.2 MHz pixel domain**: HDMI timing, RGB pixel data, DMAC AXI-Stream output
 
 The `hdmi_adapter` handles the clock domain crossing between these two domains using LUTRAM double-buffering.
@@ -696,7 +703,7 @@ The DMA transfer completes well within one frame time (~4.6 ms out of 16.7 ms), 
 | Interface | Clock | Width | Peak bandwidth |
 |---|---|---|---|
 | DDR3 (PS7) | 533 MHz DDR | 16-bit | ~8.5 Gbps |
-| AXI HP0 (PS↔PL) | 100 MHz | 64-bit | 6.4 Gbps |
+| AXI HP0 (PS↔PL) | 80 MHz | 64-bit | 5.12 Gbps |
 | AXI DMAC stream | 25.2 MHz | 64-bit | ~1.6 Gbps |
 | TMDS per lane | 126 MHz DDR | 10-bit serial | 1.26 Gbps |
 | Required for 640×480 | — | — | ~0.44 Gbps |

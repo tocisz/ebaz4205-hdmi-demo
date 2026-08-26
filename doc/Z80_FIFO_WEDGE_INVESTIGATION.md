@@ -1,5 +1,7 @@
 # Z80 `term` Output Wedge — Investigation Record
 
+**Status: FIXED and field-verified (2026-08) — `axi_fifo_lite` deployed; `z80 term` drain fix shipped. This document is retained as the investigation record (see §5b–§5c).**
+
 **Date:** 2026-07 (investigation session)
 **Symptom:** During sustained guest output bursts (NASCOM BASIC banner, FORTH
 `words` listing) on the EBAZ4205 z80_soc, terminal output stops mid-burst. The
@@ -21,22 +23,22 @@ questions — so the investigation can be resumed or explained fresh.
 Data path host ↔ Z80:
 
 ```
-Linux user  ──/dev/axis_fifo_0x7c450000──  axis_fifo.ko  ──  axi_fifo_mm_s IP
+Linux user  ──/dev/axis_fifo_0x7c450000──  axis_fifo.ko  ──  axi_fifo_lite IP (drop-in for axi_fifo_mm_s)
                                                                 │ AXI_STR_TXD (PS→PL) / AXI_STR_RXD (PL→PS)
-                                                           axis_byte_bridge (32-bit word ↔ byte)
+                                                           axis_byte_bridge (32-bit word ↔ byte, TLAST per word)
                                                                 │ io_rx_* / io_tx_* handshake
                                                            z80_soc: raw I/O ports + acia68b50 (ports 0x80/0x81)
                                                                 │
                                                               tv80 CPU (guest BASIC / FORTH)
 ```
 
+> **Current:** `axi_fifo_mm_s` replaced by `axi_fifo_lite` (`hdl/library/axi_fifo_lite/`, instance still `axi_fifo_mm_s_0` @ `0x7C450000` — DT `compatible="xlnx,axi-fifo-mm-s-4.1"` / `axis_fifo.ko` unchanged). The wedge described below is **fixed** on the deployed bitstream (see §5b–§5c).
+
 Key configuration (`hdl/projects/ebaz4205/system_bd.tcl`, lines 299–330):
 
-* `axi_fifo_mm_s`: TX and RX depth **1024 words each**
-  (`C_TX_FIFO_DEPTH`/`C_RX_FIFO_DEPTH` = 1024)
-* **Store-and-forward both directions**: `C_USE_TX_CUT_THROUGH 0`,
-  `C_USE_RX_CUT_THROUGH 0`
-* Base address `0x7C450000`; z80_soc control regs at `0x7C440000`
+* FIFO: **1024 words each direction** (`DEPTH=1024`; Xilinx IP params `C_TX_FIFO_DEPTH`/`C_RX_FIFO_DEPTH` = 1024). `axi_fifo_lite` is fixed 1024, single-word packets (`TLR=4`, `RLR=4`, `TLAST=1` per word).
+* Old Xilinx IP was **store-and-forward both directions**: `C_USE_TX_CUT_THROUGH 0`, `C_USE_RX_CUT_THROUGH 0` (later `1` — neither fixed the wedge; see §5a). Lite has no cut-through param (always forward, no packet-commit).
+* Base address `0x7C450000`; z80_soc control regs at `0x7C440000` (80 MHz `FCLK_CLK0`; HDMI MMCM re-tuned 100→80 MHz: `DIVCLK 5→4`, `CLKIN 10.0→12.5 ns` — same 25.2/126 MHz pixel clocks).
 
 Relevant sources:
 
@@ -259,7 +261,7 @@ of "each keypress shows more characters".
    stuck low while RDFO < depth; also watch bridge staging-reg state at stall.~~
    **Done 2026-07 — xsim reproduction, see §5b. `axis_accepts` proves the bridge
    delivered every `tvalid` (2300/2300), so the wedge is inside `axi_fifo_mm_s`.
-   A behavioral FIFO with the same register map passes.**
+   `axi_fifo_lite` with the same register map passes (BYTES=2300/10000).**
 3. Re-test L6 on the cut-through bitstream: confirm whether *any*
    FIFO-register-only recovery exists, or whether CPU reset is now always
    required (§5a result 5).
@@ -269,16 +271,17 @@ of "each keypress shows more characters".
 6. ~~Decide whether to keep `C_USE_RX_CUT_THROUGH 1` or revert to 0
    (`system_bd.tcl`) — neither mode fixes the wedge; cut-through additionally
    showed possible byte drops but survives longer before stalling.~~
-   **Superseded by §5b — both modes wedge identically; the fix is `axi_fifo_lite`
-   (see §5b), not a cut-through toggle. Leave `system_bd.tcl` at 1 until the
-   Lite swap lands, then remove the parameter.**
+   **Done — superseded by §5b. Both modes wedge identically; fixed by
+   `axi_fifo_lite` (see §5b). `system_bd.tcl` now instantiates `axi_fifo_lite`
+   and the parameter is removed.**
 7. Optional UX hardening in `z80_board.cli`: detect the wedge signature
    (CPU running + no output + RDFO=0 + TDFV frozen for > N seconds) and hint
    `z80 term --flush` — note that flush alone may no longer suffice; suggest
    `z80 halt load rom <img> reset run` style full restart when it fails.
-8. Swap `axi_fifo_mm_s` for `axi_fifo_lite` (see §5b) — pending user call.
+8. ~~Swap `axi_fifo_mm_s` for `axi_fifo_lite` (see §5b) — pending user call.
    Verify on hardware: `TDFV=0x400` after reset, 10× `words` bursts, no phantom
-   NUL, `make sdimg` timing, and `axis_fifo.ko` ABI unchanged.
+   NUL, `make sdimg` timing, and `axis_fifo.ko` ABI unchanged.~~
+   **Done 2026-08 — wired in `system_bd.tcl` (`axi_fifo_lite axi_fifo_mm_s_0`), rebuilt (`make sdimg`, WNS ≥ 0), deployed via `./scripts/ebaz_deploy.sh --bitstream-only`, and field-verified (user: "it works well"): `TDFV=0x400` after `SRR`, large bursts complete without phantom NUL / wedge. Host `z80 term` also fixed to poll stdin only — see §5c.**
 
 ---
 
@@ -427,6 +430,13 @@ multi-word packets / bursts >128 without `TLR` / ECC / CDC / IRQ not supported
 (see that README for full table). Alternative zero-RTL dodge is bridge v2
 packing (4 B → 1 word, packet rate 4× lower → wedge beyond FORTH `words`
 size).
+
+## 5c. Hardware verification + host `term` fix + RTL hardening (2026-08)
+
+* **Bitstream rebuilt and deployed** (`make sdimg`, WNS ≥ 0; `./scripts/ebaz_deploy.sh --bitstream-only`; host verified `TDFV=0x400` after `SRR` vs old `0x3FC`). Large FORTH `words` bursts now complete without stall/phantom NUL (user field report: "it works well").
+* **Host `z80 term` burst fix** — `axis_fifo` has no `f_op->poll`, so polling the FIFO fd is meaningless. Old `_cmd_term` read one byte per poll event and stalled after bursts; each keystroke was the only remaining wake-up. `demos/z80_asm/z80_board/cli.py` now polls **stdin only** (20 ms timeout) and **drains all queued packets** with non-blocking `read_available(fd, 4096)` on every wake; `hw.py`'s `read_available` uses a 4096 B buffer (≥ max `RLR`) so `EINVAL` cannot wedge the FIFO. Fixes the "each keypress releases one more byte" stall even before the Lite swap; with Lite it provides the intended interactive behaviour. 12 new tests in `demos/z80_asm/tests/test_fifo.py` (102 total).
+* **RTL hardening for Vivado DRC** — early Lite split shared state across 4× `always_ff` (legal in xsim, `last assignment wins`, but Vivado `DRC MDRV-1` flagged multiple-driver nets and aborted `opt_design`). Merged to a **single `always_ff`** driving all shared registers (`rx_cnt`, `tx_cnt`, pointers, `rvalid`, etc.). RX ingest + `RDFD` pop now handled **losslessly in the same cycle** (both pointers advance, net-zero count; 1-cycle latency — "small latency is OK if packets aren't lost"). TX path remains last-wins for `TLR` vs `axi_str_txd` pop (keystroke-rate, microsecond-rare — deferred).
+* **8 KiB ROM / 56 KiB RAM / 80 MHz FCLK** unchanged; HDMI MMCM already re-tuned (`DIVCLK 5→4`, `CLKIN 10.0→12.5 ns`) to keep 25.2/126 MHz pixel clocks at 80 MHz.
 
 ## 6. Reproduction toolkit (as used in this session)
 
