@@ -335,6 +335,14 @@ verification samples interior quartiles (not just ends); an image that
 writes nothing into the selected space errors instead of "succeeding";
 `term` exits on FIFO POLLHUP/POLLERR instead of hanging until Ctrl-].
 
+Term burst fix (post-board): the staging axis_fifo driver has no
+`f_op->poll`, so waiting for POLLIN on the device is meaningless — after a
+large output burst the RX FIFO filled, the Z80 stalled on ACIA TDRE, and
+each keystroke (the only remaining wake-up) released exactly one more byte.
+`term` now polls stdin only (20 ms timeout) and drains every queued packet
+with non-blocking reads on each wake; reads use a 4096-byte buffer so a
+stuck RLR cannot wedge the FIFO with EINVAL.
+
 ---
 
 ## File touch list

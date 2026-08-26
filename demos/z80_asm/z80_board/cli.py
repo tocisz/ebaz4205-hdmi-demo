@@ -13,6 +13,7 @@ Common flows::
 """
 
 import argparse
+import errno
 import os
 import select
 import sys
@@ -433,6 +434,52 @@ def _cmd_flush(fifo_fd: int, quiet: bool) -> None:
         print(f"  Discarded {discarded} stale FIFO packet(s)", file=sys.stderr)
 
 
+def _drain_fifo_to(fifo_fd: int, out_fd: int) -> int:
+    """Copy every currently queued FIFO byte to ``out_fd``. Return count."""
+    data = hw.read_available(fifo_fd)
+    if data:
+        os.write(out_fd, bytes(data))
+    return len(data)
+
+
+def _forward_stdin_to_fifo(stdin_fd: int, fifo_fd: int) -> bool:
+    """Send one keystroke to the Z80. Return False if the user asked to detach."""
+    ch = os.read(stdin_fd, 1)
+    if not ch or ch == b"\x1d":  # Ctrl-]
+        return False
+    try:
+        hw.write_byte(fifo_fd, ch[0])
+    except BlockingIOError:
+        pass
+    except OSError as exc:
+        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
+            raise
+    return True
+
+
+def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
+                  poll_timeout_ms: int = 20) -> None:
+    """Bridge stdin/stdout to the AXI FIFO until Ctrl-].
+
+    ``axis_fifo`` has no ``f_op->poll``, so POLLIN on the device is not a
+    usable edge.  The previous loop read *one* byte per poll event and then
+    waited: after a burst the RX FIFO filled, the Z80 stalled on TDRE, and
+    each keystroke (the only remaining wake-up) released one more byte.
+    Drain on every wake — including the timeout — and poll stdin only.
+    """
+    poll = select.poll()
+    poll.register(stdin_fd, select.POLLIN)
+    running = True
+    while running:
+        events = poll.poll(poll_timeout_ms)
+        for fd, event in events:
+            if fd == stdin_fd and (event & select.POLLIN):
+                if not _forward_stdin_to_fifo(stdin_fd, fifo_fd):
+                    running = False
+                    break
+        _drain_fifo_to(fifo_fd, stdout_fd)
+
+
 def _cmd_term(fifo_fd: int, opts: dict, quiet: bool) -> None:
     if opts["flush"]:
         _cmd_flush(fifo_fd, quiet)
@@ -442,32 +489,10 @@ def _cmd_term(fifo_fd: int, opts: dict, quiet: bool) -> None:
         _err("term requires an interactive terminal — use ssh -t z80 term")
     try:
         tty.setraw(sys.stdin)
-        poll = select.poll()
-        poll.register(sys.stdin, select.POLLIN)
-        poll.register(fifo_fd, select.POLLIN)
         if not quiet:
             print("  Terminal attached — Ctrl-] to detach (CPU keeps running).",
                   file=sys.stderr)
-        running = True
-        while running:
-            events = poll.poll(50)
-            for fd, event in events:
-                if fd == fifo_fd and (event & (select.POLLERR | select.POLLHUP)):
-                    # FIFO device reported an error or went away: stop
-                    # polling instead of spinning until Ctrl-].
-                    running = False
-                    break
-                if fd == sys.stdin.fileno():
-                    ch = os.read(sys.stdin.fileno(), 1)
-                    if not ch or ch == b"\x1d":  # Ctrl-]
-                        running = False
-                        break
-                    hw.write_byte(fifo_fd, ch[0])
-                elif fd == fifo_fd:
-                    b = hw.read_byte(fifo_fd)
-                    if b is not None:
-                        os.write(sys.stdout.fileno(), bytes([b]))
-                        sys.stdout.flush()
+        _term_session(fifo_fd, sys.stdin.fileno(), sys.stdout.fileno())
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attr)
 
@@ -678,32 +703,11 @@ def legacy_main(argv: list[str]) -> int:
                 old_attr = termios.tcgetattr(sys.stdin)
                 try:
                     tty.setraw(sys.stdin)
-                    poll = select.poll()
-                    poll.register(sys.stdin, select.POLLIN)
-                    poll.register(fifo_fd, select.POLLIN)
                     if not args.quiet:
                         print("  Interactive mode. Ctrl-C or Ctrl-] to quit.",
                               file=sys.stderr)
-                    running = True
-                    while running:
-                        events = poll.poll(50)  # 50 ms timeout
-                        for fd, event in events:
-                            if fd == fifo_fd and (event
-                                                  & (select.POLLERR
-                                                     | select.POLLHUP)):
-                                running = False
-                                break
-                            if fd == sys.stdin.fileno():
-                                ch = os.read(sys.stdin.fileno(), 1)
-                                if not ch or ch == b'\x1d':  # Ctrl-]
-                                    running = False
-                                    break
-                                hw.write_byte(fifo_fd, ch[0])
-                            elif fd == fifo_fd:
-                                b = hw.read_byte(fifo_fd)
-                                if b is not None:
-                                    os.write(sys.stdout.fileno(), bytes([b]))
-                                    sys.stdout.flush()
+                    _term_session(fifo_fd, sys.stdin.fileno(),
+                                  sys.stdout.fileno())
                 finally:
                     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attr)
             else:

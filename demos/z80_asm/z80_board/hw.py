@@ -13,7 +13,6 @@ Register map and protocol are identical to the previous single-file runner
 import errno
 import mmap
 import os
-import select
 import struct
 import time
 
@@ -262,6 +261,41 @@ def write_byte(fd: int, b: int) -> None:
     os.write(fd, bytes([b & 0xFF, 0, 0, 0]))
 
 
+def _low_bytes_from_words(word: bytes) -> list[int]:
+    """Take the payload byte of each 32-bit drop-24 word."""
+    if len(word) < 4:
+        return [word[0]] if word else []
+    return [word[i] for i in range(0, len(word) - (len(word) % 4), 4)]
+
+
+def read_available(fd: int, max_bytes: int = 4096) -> list[int]:
+    """Non-blocking drain of currently readable AXI-Stream packets.
+
+    The staging ``axis_fifo`` driver has no ``f_op->poll``.  Userspace must
+    not wait for POLLIN: a non-blocking ``read()`` is the only reliable way
+    to learn that a packet is queued.  Each v1 packet is one 32-bit word
+    (low byte = data).  The read size is large so a stuck RLR > 4 (missed
+    TLAST) cannot wedge the FIFO with EINVAL-on-4-byte-read.
+    """
+    out: list[int] = []
+    while len(out) < max_bytes:
+        try:
+            word = os.read(fd, 4096)
+        except BlockingIOError:
+            break
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
+                break
+            raise
+        if not word:
+            break
+        chunk = _low_bytes_from_words(word)
+        if not chunk:
+            break
+        out.extend(chunk)
+    return out
+
+
 def read_byte(fd: int) -> int | None:
     """Read one byte from the v1 drop-24 bridge.
 
@@ -270,17 +304,8 @@ def read_byte(fd: int) -> int | None:
     both are treated as transient for non-blocking reads.  Other errors are
     propagated instead of being silently mistaken for an empty FIFO.
     """
-    try:
-        word = os.read(fd, 4)
-        if not word:
-            return None
-        return word[0]
-    except BlockingIOError:
-        return None
-    except OSError as exc:
-        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
-            return None
-        raise
+    got = read_available(fd, max_bytes=1)
+    return got[0] if got else None
 
 
 def flush_fifo(fd, settle: float = 0.10) -> int:
@@ -294,25 +319,19 @@ def flush_fifo(fd, settle: float = 0.10) -> int:
     quiet_deadline = time.monotonic() + settle
 
     while True:
-        got_data = False
-        while True:
-            b = read_byte(fd)
-            if b is None:
-                break
-            discarded += 1
-            got_data = True
-
+        got = read_available(fd)
         now = time.monotonic()
-        if got_data:
+        if got:
+            discarded += len(got)
             quiet_deadline = now + settle
         if now >= quiet_deadline:
             return discarded
 
-        # Wait for either another packet or the quiet period to expire.  A
-        # short timeout is intentional: some axis-fifo driver versions do
-        # not make poll/select edge notifications reliable after EINVAL.
+        # Do not wait on poll/select: axis_fifo has no f_op->poll, so those
+        # either spin (DEFAULT_POLLMASK) or never report a queued packet.
         timeout = min(0.005, quiet_deadline - now)
-        select.select([fd], [], [], max(0.0, timeout))
+        if timeout > 0:
+            time.sleep(timeout)
 
 
 def capture_fifo_output(
@@ -342,17 +361,14 @@ def capture_fifo_output(
         if max_bytes and len(captured) >= max_bytes:
             break
 
-        rl, _, _ = select.select([fd], [], [], 0.05)
-        if rl:
-            while True:
-                b = read_byte(fd)
-                if b is None:
-                    break
-                captured.append(b)
-                last_activity = time.monotonic()
-                if max_bytes and len(captured) >= max_bytes:
-                    break
-        elif time.monotonic() - last_activity > idle_timeout:
+        remaining = None if max_bytes is None else max_bytes - len(captured)
+        got = read_available(fd, max_bytes=remaining or 4096)
+        if got:
+            captured.extend(got)
+            last_activity = time.monotonic()
+            continue
+        if time.monotonic() - last_activity > idle_timeout:
             break
+        time.sleep(0.05)
 
     return captured

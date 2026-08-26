@@ -245,6 +245,9 @@ Same as bf2_soc — see `doc/Z80_SOC_PLAN.md` or `doc/AXIS_FIFO_BRIDGE.md`.
    Detach with Ctrl-]; the CPU keeps running. `term --flush` discards
    buffered output first. Note: `flush` cannot clear a stale byte already
    held in the ACIA RX register.
+   The term loop drains the FIFO on every wake (keystroke or 20 ms timeout)
+   — the axis_fifo driver has no poll support, so output keeps flowing
+   after large bursts without anyone typing.
 5. **New-style `run` ≠ legacy `run`**: on the board, `z80 run` resumes the
    CPU (no reset, no load). To restart from PC=0 use `z80 reset run`.
    `z80 run FILE.bin [options]` is the legacy one-shot compatibility path
