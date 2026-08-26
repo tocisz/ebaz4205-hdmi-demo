@@ -12,9 +12,10 @@ operation — though after the RX cut-through experiment (§5a) flush alone may
 no longer suffice in deep-stall states.
 
 This document records established **facts** (each with references/evidence),
-**lemmas** (things deduced from facts), the **hypotheses** (with per-hypothesis
-status after testing — see §4 and §5a), and open
-questions — so the investigation can be resumed or explained fresh.
+**lemmas** (things deduced from facts), the **proven root cause** (see §4 —
+Xilinx `axi_fifo_mm_s` bug at single-word packets, reproduced in xsim §5b),
+the **hypotheses** (with per-hypothesis status after testing — see §4a and §5a),
+and open questions — so the investigation can be resumed or explained fresh.
 
 ---
 
@@ -204,7 +205,58 @@ of "each keypress shows more characters".
 
 ---
 
-## 4. Hypotheses
+## 4. Root Cause — Xilinx `axi_fifo_mm_s` v4.3 bug (proven in xsim, §5b)
+
+**The wedge is not a driver, guest, bridge, or ACIA bug.** The Xilinx
+`axi_fifo_mm_s` IP at **1024-word depth** with **one AXI-Stream word = one packet
+(`TLAST=1` per word, as driven by `axis_byte_bridge` v1 drop-24)** corrupts its
+internal state after **~1.9k packets** — even at low occupancy and without the
+FIFO ever filling. The same RTL wedge reproduces bit-identically in xsim
+with the *real* IP and disappears when only the FIFO is swapped for a trivial
+behavioral model / `axi_fifo_lite`.
+
+* **Vacancy counter never initializes:** `TDFV` reads `0x3FC` (not `0x400`)
+immediately after `s_axi_aresetn` (before any `SRR`/`TDFR`/`RDFR`), in both
+cut-through modes and on-board (F3, H5, §5b `post-hard-rst`). Spec
+`SRR → poll TRC|RRC` does not fix it — the IP's reset value is wrong.
+* **Phantom zero-data packet:** at a deterministic offset (board: offset 633
+`fill [NUL] query`; xsim: offset 1917 `expected 0x85`) a spurious NUL packet
+is inserted (`F7`). Text after it is the correct continuation — this is a
+single-packet insertion, not a global pointer shift.
+* **Length-queue / register-file desync:** after the phantom, `RDFO` inflates
+well beyond remaining bytes (e.g. `RDFO=1532` vs `383` remaining) and the
+AXI-Lite register file aliases (`ISR=0x85D80000` with `RPURE`, `ANOMALY RX word
+upper bits 0x85D80000`, `RDFO` 2.1B in simulation). `ISR` threshold bits
+latch but no `RPURE`/`RPORE` storm is otherwise visible (F3).
+* **`tready` stops publishing:** despite `axis_accepts == sent` (every
+`s_axis_tvalid/tready` from `axis_byte_bridge` accepted, §5b) the IP stops
+making packets visible to the host (`RDFO=0` to the driver while the bridge
+holds `tready` low). That stalls `io_tx_ready` → ACIA `tx_hold` undrained
+→ `TDRE=0` → guest spins on `TXA` polling `SER_TDRE=$02` (`int32k.asm`) → CPU
+appears stuck but `halted=no` (L4). The state is fabric-resident (survives
+chardev close, L5) and is revived only by a FIFO reset (milder wedges) or
+FIFO+CPU reset (deep stall, §5a result 5).
+* **Not occupancy-driven:** aggressive drainer saw peak `RDFO` only 37–90
+words yet still wedged at ~1.3 KB (F6); larger `BYTES=4000` wedges later
+(`3232`) with `BYTE DROPPED` at 2973 — the count is packet-based, not
+time/baud-based.
+* **Not bridge / ACIA / host:** `axis_accepts=2300/2300` exonerates the
+bridge; ACIA `tx_hold` + `TDRE` is correct by poll; host `RDFO→RLR→RDFD`
+and `read_available(4096 ≥ max RLR)` matches `axis_fifo.c` exactly. A
+separate host bug — `axis_fifo` having **no `f_op->poll`** so `term` read one
+byte per poll event and starved — exacerbated the stall but was fixed
+independently in `z80_board` (poll stdin only + drain all queued packets;
+see §5c).
+
+**Fix:** `hdl/library/axi_fifo_lite/` — behavioral drop-in with the same
+`0x7C450000` / `axi_fifo_mm_s_0` / `axis_fifo.ko` ABI, fixed `0x400` vacancy,
+`RLR=4`, single-word packets, correct `tready`. Proven in xsim
+(`BYTES=2300/10000 PASS`, `max_occ=1..1024`) and field-verified on hardware
+(`TDFV=0x400`, large `words` bursts complete, no phantom NUL — §5c).
+Vivado 2024.x still ships `axi_fifo_mm_s v4.3` with the same `xpm_fifo`
+subcore (PG080 only adds ECC), so upgrading would not fix it.
+
+## 4a. Hypotheses (historical — retained for why the above is the cause)
 
 * **H1 (original form REFUTED 2026-07, see §5a): race inside the axi_fifo_mm_s
   RX store-and-forward packet-commit logic.** With TLAST-always-high, every
@@ -252,7 +304,7 @@ of "each keypress shows more characters".
 
 ---
 
-## 5. Open questions / next steps
+## 5. Open questions / next steps (remaining after root cause is proven)
 
 1. ~~Rebuild bitstream with `C_USE_RX_CUT_THROUGH 1` and rerun the
    reproduction scripts.~~ **Done 2026-07 — did not fix the wedge; see §5a.**
