@@ -535,11 +535,14 @@ def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
                   poll_timeout_ms: int = 20) -> None:
     """Bridge stdin/stdout to the AXI FIFO until Ctrl-] or EOF.
 
-    ``axis_fifo`` has no ``f_op->poll``, so POLLIN on the device is not a
-    usable edge.  Drain on every wake — including the timeout — and poll
-    stdin only.  Handles both interactive ttys and piped input: when
-    stdin is a pipe, POLLHUP / POLLERR / POLLNVAL are treated as
-    readable so the final bytes are drained and EOF is detected.
+    Phase 3 still uses timeout-poll: drain on every wake (including the
+    20 ms timeout) and poll stdin only.  The new ``axi_byte_fifo``
+    driver *does* expose ``f_op->poll`` (Phase 2), but switching the
+    host to POLLIN on the FIFO fd is deferred to Phase 6 (after Phase 5
+    verification) — see doc/AXI_BYTE_FIFO_PLAN.md.  Handles both
+    interactive ttys and piped input: when stdin is a pipe, POLLHUP /
+    POLLERR / POLLNVAL are treated as readable so the final bytes are
+    drained and EOF is detected.
     """
     global _last_was_cr
     _last_was_cr = False

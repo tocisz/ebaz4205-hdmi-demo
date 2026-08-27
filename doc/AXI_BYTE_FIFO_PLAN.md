@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` + `DRIVER_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean with `arm-buildroot-gcc`).
+**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean; `run_z80_tests.sh` 100 OK).
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -76,7 +76,7 @@ Register map after (from base `0x7C450000`):
 
 Mirror PL deletion — no length register, no word bounce, no `%4` guards. Old driver kept (Option A fork).
 
-- [x] Fork driver: `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5 (Option B rejected)
+- [x] Fork driver: `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5/6 (Option B rejected; now kept until Phase 6 poll switch per user request)
 - [x] `axi-byte-fifo.c` (from `axis-fifo.c` 470 LOC, 19 KiB):
   - [x] `DRIVER_NAME "axi_byte_fifo"`, `of_match "xlnx,axi-byte-fifo-1.0"` (`xlnx,axi-fifo-mm-s-4.1` removed)
   - [x] Deleted `READ_BUF_SIZE`/`WRITE_BUF_SIZE`, `tmp_buf[128]` word bounce, `TDR`/`RDR`/`TLR`/`RLR` sysfs (kept `isr/ier/tdfr/tdfv/tdfd/rdfr/rdfo/rdfd/srr` only)
@@ -90,21 +90,29 @@ Mirror PL deletion — no length register, no word bounce, no `%4` guards. Old d
 - [x] Build: verified `axi-byte-fifo.c` compiles clean with `arm-buildroot-linux-gnueabihf-gcc` (same flags as `axis-fifo.c`, exit 0, no warnings) — full `make modules` / `modinfo` deferred to board deploy
 - [x] Keep old `axis_fifo.ko` until cutover — `linux/drivers/staging/axis-fifo/` untouched (verified still builds, `axis-fifo.c` unchanged)
 
-### Phase 3 — Userspace: `demos/z80_asm/z80_board` — Status: `PENDING`
+### Phase 3 — Userspace: `demos/z80_asm/z80_board` — Status: `DONE` 2026-08-27
 
-Delete the Python drop-24 shim.
+Delete the Python drop-24 shim. **No `.poll()` switch yet** — the new
+`axi_byte_fifo` driver does expose `f_op->poll` (Phase 2), but Phase 3
+keeps the host on timeout-poll (stdin-only `select.poll` + drain on
+20 ms timeout + `EAGAIN` retry).  Switching `cli._term_session` to
+`POLLIN`/`POLLOUT` on the FIFO fd is deferred to **Phase 6** (after
+Phase 5 verification) per user request so the byte shim can be
+verified first and rollback stays trivial (old `axis_fifo` still works
+via fallback).
 
-- [ ] `demos/z80_asm/z80_board/hw.py`:
-  - [ ] `FIFO_DEV="/dev/axi_byte_fifo_0x7c450000"` (or keep both paths with fallback), `FIFO_BASE=0x7C450000`
-  - [ ] `write_byte(fd,b)` → `os.write(fd, bytes([b & 0xFF]))` (was `bytes([b,0,0,0])`)
-  - [ ] Delete `_low_bytes_from_words()` (no `word[0]` extraction)
-  - [ ] `read_available(fd, max_bytes=4096)` → `os.read(fd,4096)` returns `list(word)` directly (was `4096` word-sized read + `_low_bytes` loop); keep `EAGAIN/EINVAL` transient handling
-  - [ ] `read_byte`, `flush_fifo`, `capture_fifo_output` unchanged except they now see bytes not words; `reset_fifo_buffers()` still `mmap` `TDFR/RDFR=0xA5`
-  - [ ] Update docstring: "byte bridge, no packet"
-- [ ] `demos/z80_asm/z80_board/cli.py`: no logic change — `hw.write_byte`/`read_available` now byte-correct, `EAGAIN` retry (`deadline 1.0s + drain RX +5ms`) is still RTS backpressure, `_INPUT_TRANSLATE={0x08:0x7F,0x09:0x20,0x0A:0x0D}` + CRLF collapse + `0.5s` pipe linger kept
-- [ ] `demos/brainfuck_org/run_bf1_program.py`: same `FIFO_DEV` update if kept
-- [ ] `demos/z80_asm/tests/test_fifo.py` + `tests/mock_board.py`: `_packet(*bytes_)` → `bytes(bytes_)` (not `b"\xNN\x00\x00\x00"`), remove word-alignment tests, keep drain/term tests
-- [ ] `demos/z80_asm/install_to_board.sh`: install `axi_byte_fifo.ko` or both, update `z80_board` package
+- [x] `demos/z80_asm/z80_board/hw.py`:
+  - [x] `FIFO_DEV="/dev/axi_byte_fifo_0x7c450000"` + `FIFO_DEV_LEGACY="/dev/axis_fifo_0x7c450000"` fallback, `FIFO_BASE=0x7C450000` unchanged
+  - [x] `write_byte(fd,b)` → `os.write(fd, bytes([b & 0xFF]))` (was `bytes([b,0,0,0])`)
+  - [x] Deleted `_low_bytes_from_words()` (no `word[0]` extraction)
+  - [x] `read_available(fd, max_bytes=4096)` → `os.read(fd,4096)` returns `list(chunk)` directly; keep `EAGAIN/EINVAL` transient handling
+  - [x] `read_byte`, `flush_fifo`, `capture_fifo_output` unchanged except they now see bytes not words; `reset_fifo_buffers()` still `mmap` `TDFR/RDFR=0xA5`
+  - [x] `open_fifo(device=None)` falls back `FIFO_DEV → FIFO_DEV_LEGACY` on `FileNotFoundError` (atomic cutover until Phase 4)
+  - [x] Docstring: "byte bridge, no packet" + fallback note; `flush_fifo` comment notes poll deferred
+- [x] `demos/z80_asm/z80_board/cli.py`: no logic change — `hw.write_byte`/`read_available` now byte-correct, `EAGAIN` retry (`deadline 1.0s + drain RX +5ms`) is still RTS backpressure, `_INPUT_TRANSLATE={0x08:0x7F,0x09:0x20,0x0A:0x0D}` + CRLF collapse + `0.5s` pipe linger kept; `_term_session` docstring updated to note poll deferred
+- [x] `demos/brainfuck_org/run_bf1_program.py`: same `FIFO_DEV` + fallback, `write_byte`/`read_byte` byte-stream
+- [x] `demos/z80_asm/tests/test_fifo.py`: `_packet(*bytes_)` → `bytes(bytes_)`, removed `LowBytesTest` (word-alignment), kept drain/term tests, added `test_multiple_writes_coalesce` + `test_write_byte_is_single_byte`; `run_z80_tests.sh` **100 OK**
+- [x] `demos/z80_asm/install_to_board.sh`: (no change needed for Phase 3 — `z80_board/hw.py`+`cli.py` already uploaded; kernel `.ko` install deferred to Phase 4 atomic deploy)
 
 ### Phase 4 — Integration wiring — Status: `PENDING`
 
@@ -114,15 +122,41 @@ Delete the Python drop-24 shim.
 - [ ] `hdl/projects/ebaz4205/system_bd.tcl`: finalize instance name `axi_byte_fifo_0` vs keeping `axi_fifo_mm_s_0` alias for old DT — pick one after name ACK
 - [ ] `ADDRESS_MAP.md` / `doc/ARCHITECTURE.md` / `doc/PL_TTY_DEVICE.md` note new device path
 
-### Phase 5 — Verification — Status: `PENDING`
+### Phase 5 — Verification (byte FIFO, timeout-poll) — Status: `PENDING`
+
+Verify the atomic cutover works **without** yet switching to `poll()`:
+`cli._term_session` stays on the Phase-3 timeout-poll loop so Phase 5
+proves the byte FIFO + RTS + fallback in isolation.
 
 - [ ] PL lint+sims: `verilator --lint-only`, `make -C hdl/library/z80_soc sim-acia`, `sim-verilator`, `make -C hdl/library/axis_byte_bridge sim` — 30 checks PASS, TEST4 `rts_n` still stalls PS→PL only
 - [ ] Module load: `ssh ebaz 'modprobe axi_byte_fifo && ls -l /dev/axi_byte_fifo_* && cat /sys/class/misc/axi_byte_fifo_*/ip_registers/tdfv'` → `0x400` after `SRR`, `rdfo` bytes
-- [ ] Host tests: `./demos/z80_asm/run_z80_tests.sh` → `102 OK` (updated)
+- [ ] Host tests: `./demos/z80_asm/run_z80_tests.sh` → `100 OK` (Phase 3 updated)
 - [ ] Hardware byte-stream: `ssh ebaz 'z80 halt; z80 reset; z80 run'` + `printf 'HELLO\r' | ssh ebaz z80 term` → echo, interactive `z80 term`
 - [ ] Burst that previously needed RTS: `cat ~/repos/z80/TC2014-FORTH/scripts/todos2.f | ssh ebaz z80 term` → clean `; OK` lines (no `? MSG #0` / `variaoetN1u`), `cat` throughput now honest byte rate (no 4× write amplification)
 - [ ] `make sdimg` WNS ≥0, `report_utilization` BRAM: `axi_fifo` 8 KiB → 2 KiB (-75%)
-- [ ] Delete old driver/PL alias after verification
+- [ ] Delete old driver/PL alias after verification (keep until Phase 6 if poll switch wants fallback)
+
+### Phase 6 — Host `poll()` switch (after verification) — Status: `PENDING` (new — per user request)
+
+Switch the host from timeout-poll to honest `f_op->poll` **after**
+Phase 5 has proven the byte FIFO.  Deferred from Phase 3/5 so
+verification and rollback stay clean.
+
+- [ ] `demos/z80_asm/z80_board/cli.py:_term_session`: register FIFO fd
+  with `select.poll()` for `POLLIN` (`RDFO>0`) alongside stdin
+  `POLLIN`; replace the 20 ms timeout drain with poll-wake drain.
+  Keep stdin `POLLHUP/POLLERR/POLLNVAL` handling and 0.5 s pipe linger.
+  Optional: also `POLLOUT` (`TDFV`) for write-side backpressure
+  instead of the `EAGAIN` 1.0 s + 5 ms sleep loop, but keep that loop
+  as fallback until poll is proven.
+- [ ] `demos/z80_asm/z80_board/hw.py`: update `flush_fifo` /
+  `read_available` comments (no longer "no f_op->poll");
+  `capture_fifo_output` may optionally use poll.
+- [ ] `demos/z80_asm/tests/test_fifo.py`: add poll-aware tests
+  (mock `select.poll` returning `POLLIN` on FIFO fd).
+- [ ] Verification: `run_z80_tests.sh` still `100 OK`; hardware
+  `cat todos2.f | ssh ebaz z80 term` still clean but with lower CPU
+  (no 50 Hz wake); `strace -e poll` shows poll wait on FIFO fd.
 
 ---
 

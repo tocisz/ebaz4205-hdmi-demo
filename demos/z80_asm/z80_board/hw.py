@@ -4,10 +4,11 @@ Provides:
   * Z80Board — mmap'd /dev/mem access to the axi_gpreg control registers
     (GP0 = CPU control/status, GP1 = RAM port, GP2 = ROM port).
   * FIFO helpers — open / reset / stream bytes through
-    /dev/axis_fifo_0x7c450000 (PS <-> PL byte bridge).
+    /dev/axi_byte_fifo_0x7c450000 (PS <-> PL byte bridge, 8-bit).
 
-Register map and protocol are identical to the previous single-file runner
-(and to bf2_soc before it); no RTL changes required.
+Byte stream: one byte per TDATA beat, no TLAST/TLR/RLR packets.
+Legacy path /dev/axis_fifo_0x7c450000 is tried as fallback until the
+board has been re-imaged with the byte-FIFO bitstream+driver.
 """
 
 import errno
@@ -41,8 +42,9 @@ RAM_SIZE = 56 * 1024     # 56K × 8 (Z80 addresses 0x2000–0xFFFF)
 # Z80 address of the first RAM byte (PS offset = Z80 addr - RAM_BASE)
 RAM_BASE = 0x2000
 
-# AXI-Stream FIFO device and PG080 register map
-FIFO_DEV = "/dev/axis_fifo_0x7c450000"
+# AXI-Stream FIFO device — byte FIFO (Phase 3), legacy kept as fallback
+FIFO_DEV = "/dev/axi_byte_fifo_0x7c450000"
+FIFO_DEV_LEGACY = "/dev/axis_fifo_0x7c450000"
 FIFO_BASE = 0x7C450000
 FIFO_TDFR = 0x08  # transmit FIFO reset (PS -> Z80)
 FIFO_RDFR = 0x18  # receive FIFO reset (Z80 -> PS)
@@ -223,9 +225,23 @@ class Z80Board:
 # FIFO helpers
 # ===================================================================
 
-def open_fifo(device: str = FIFO_DEV) -> int:
-    """Open the axis_fifo device for read/write (non-blocking from open)."""
-    return os.open(device, os.O_RDWR | os.O_NONBLOCK)
+def open_fifo(device: str | None = None) -> int:
+    """Open the FIFO device for read/write (non-blocking from open).
+
+    ``device`` defaults to ``FIFO_DEV`` with fallback to the legacy
+    ``FIFO_DEV_LEGACY`` (``/dev/axis_fifo_*`` packet FIFO) so a new
+    host tree still works against an old board image until Phase 4
+    atomic cutover.  An explicit ``/dev/axi_byte_fifo_*`` that is
+    missing also falls back to the legacy path.
+    """
+    if device is None:
+        device = FIFO_DEV
+    try:
+        return os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if device == FIFO_DEV:
+            return os.open(FIFO_DEV_LEGACY, os.O_RDWR | os.O_NONBLOCK)
+        raise
 
 
 def reset_fifo_buffers() -> None:
@@ -257,39 +273,30 @@ def reset_fifo_buffers() -> None:
 
 
 def write_byte(fd: int, b: int) -> None:
-    """Send one byte through the v1 drop-24 bridge (4-byte write)."""
-    os.write(fd, bytes([b & 0xFF, 0, 0, 0]))
-
-
-def _low_bytes_from_words(word: bytes) -> list[int]:
-    """Take the payload byte of each 32-bit drop-24 word."""
-    if len(word) < 4:
-        return [word[0]] if word else []
-    return [word[i] for i in range(0, len(word) - (len(word) % 4), 4)]
+    """Send one byte through the byte-stream FIFO (single-byte write)."""
+    os.write(fd, bytes([b & 0xFF]))
 
 
 def read_available(fd: int, max_bytes: int = 4096) -> list[int]:
-    """Non-blocking drain of currently readable AXI-Stream packets.
+    """Non-blocking drain of currently readable bytes.
 
-    The staging ``axis_fifo`` driver has no ``f_op->poll``.  Userspace must
-    not wait for POLLIN: a non-blocking ``read()`` is the only reliable way
-    to learn that a packet is queued.  Each v1 packet is one 32-bit word
-    (low byte = data).  The read size is large so a stuck RLR > 4 (missed
-    TLAST) cannot wedge the FIFO with EINVAL-on-4-byte-read.
+    Byte-stream FIFO: one byte per TDATA beat.  The new ``axi_byte_fifo``
+    driver exposes ``f_op->poll`` (Phase 2) but ``_term_session`` still
+    uses timeout-poll (Phase 3 keeps the old stdin-only polling loop;
+    switching to POLLIN on the FIFO fd is deferred to Phase 6, after
+    Phase 5 verification — see doc/AXI_BYTE_FIFO_PLAN.md).
+    A non-blocking ``read()`` is still the drain primitive.
     """
     out: list[int] = []
     while len(out) < max_bytes:
         try:
-            word = os.read(fd, 4096)
+            chunk = os.read(fd, 4096)
         except BlockingIOError:
             break
         except OSError as exc:
             if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
                 break
             raise
-        if not word:
-            break
-        chunk = _low_bytes_from_words(word)
         if not chunk:
             break
         out.extend(chunk)
@@ -297,12 +304,9 @@ def read_available(fd: int, max_bytes: int = 4096) -> list[int]:
 
 
 def read_byte(fd: int) -> int | None:
-    """Read one byte from the v1 drop-24 bridge.
+    """Read one byte from the byte-stream FIFO.
 
-    Returns the byte or None if no data is available.  The axis-fifo driver
-    can report both EAGAIN and EINVAL while a packet is not yet readable;
-    both are treated as transient for non-blocking reads.  Other errors are
-    propagated instead of being silently mistaken for an empty FIFO.
+    Returns the byte or None if no data is available.
     """
     got = read_available(fd, max_bytes=1)
     return got[0] if got else None
@@ -327,8 +331,12 @@ def flush_fifo(fd, settle: float = 0.10) -> int:
         if now >= quiet_deadline:
             return discarded
 
-        # Do not wait on poll/select: axis_fifo has no f_op->poll, so those
-        # either spin (DEFAULT_POLLMASK) or never report a queued packet.
+        # Phase 3 still uses timeout-poll (stdin-only poll loop in
+        # cli._term_session); the new axi_byte_fifo driver does expose
+        # f_op->poll, but switching the host to POLLIN on the FIFO fd
+        # is deferred to Phase 6 (after Phase 5 verification) per
+        # doc/AXI_BYTE_FIFO_PLAN.md.  Old axis_fifo had no poll at all
+        # (DEFAULT_POLLMASK), so waiting on it would spin.
         timeout = min(0.005, quiet_deadline - now)
         if timeout > 0:
             time.sleep(timeout)

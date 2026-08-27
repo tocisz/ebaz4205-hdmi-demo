@@ -80,8 +80,9 @@ _RUN   = 1 << 3
 CODE_RAM_SIZE = 8192   # 8K × 8
 DATA_RAM_SIZE = 32768  # 32K × 8
 
-# AXI-Stream FIFO device (v1 drop-24 bridge → bf2_soc)
-FIFO_DEV = "/dev/axis_fifo_0x7c450000"
+# AXI-Stream FIFO device — byte-stream (Phase 3); legacy kept as fallback
+FIFO_DEV = "/dev/axi_byte_fifo_0x7c450000"
+FIFO_DEV_LEGACY = "/dev/axis_fifo_0x7c450000"
 
 # ---------------------------------------------------------------------------
 # Fast data-RAM clear (binary riding counter on the bf1 CPU)
@@ -275,36 +276,41 @@ class Bf1Board:
 # FIFO helpers
 # ===================================================================
 
-def open_fifo(device: str = FIFO_DEV) -> int:
-    """Open the axis_fifo device for read/write (non-blocking from open).
+def open_fifo(device: str | None = None) -> int:
+    """Open the FIFO device for read/write (non-blocking from open).
 
     Must be non-blocking from open() time because the driver caches
     f->f_flags at open() and never re-reads it; an fcntl(F_SETFL)
     after open is invisible to the driver's read/write paths.
+    Falls back to the legacy packet FIFO if the byte FIFO device is
+    not yet present (pre-Phase-4 board image).
     """
-    return os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    if device is None:
+        device = FIFO_DEV
+    try:
+        return os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if device == FIFO_DEV:
+            return os.open(FIFO_DEV_LEGACY, os.O_RDWR | os.O_NONBLOCK)
+        raise
 
 
 def write_byte(fd: int, b: int) -> None:
-    """Send one byte through the v1 drop-24 bridge.
-
-    The driver requires 4-byte writes.  We pad to 4 bytes; the bridge's
-    [7:0] carries the actual byte and upper 24 bits are dropped.
-    """
-    os.write(fd, bytes([b, 0, 0, 0]))
+    """Send one byte through the byte-stream FIFO (single-byte write)."""
+    os.write(fd, bytes([b & 0xFF]))
 
 
 def read_byte(fd: int) -> int | None:
-    """Read one byte from the v1 drop-24 bridge.
+    """Read one byte from the byte-stream FIFO.
 
     Returns the byte or None if no data available (EAGAIN).
-    Each read() returns one 4-byte packet from the RX FIFO; byte 0 is data.
+    Each read() returns bytes; the first byte is returned.
     """
     try:
-        word = os.read(fd, 4)
-        if not word:
+        chunk = os.read(fd, 16)
+        if not chunk:
             return None
-        return word[0]
+        return chunk[0]
     except (BlockingIOError, OSError):
         return None
 

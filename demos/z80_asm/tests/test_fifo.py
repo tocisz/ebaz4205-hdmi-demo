@@ -1,8 +1,10 @@
 """FIFO drain / term-bridge tests (no hardware).
 
-The live axis_fifo driver has no f_op->poll, so term must drain with
-non-blocking reads on every wake — including a poll timeout or a
-keystroke — rather than waiting for POLLIN on the device.
+Byte-stream FIFO: one byte per TDATA beat.  The new axi_byte_fifo driver
+does expose f_op->poll, but Phase 3 still uses timeout-poll (stdin-only
+poll loop) — see doc/AXI_BYTE_FIFO_PLAN.md.  Term must still drain with
+non-blocking reads on every wake rather than waiting for POLLIN on the
+device (switch deferred to Phase 6, after Phase 5 verification).
 """
 
 import errno
@@ -15,27 +17,8 @@ from z80_board import cli
 
 
 def _packet(*bytes_) -> bytes:
-    out = bytearray()
-    for b in bytes_:
-        out.extend((b, 0, 0, 0))
-    return bytes(out)
-
-
-class LowBytesTest(unittest.TestCase):
-
-    def test_one_word(self):
-        self.assertEqual(hw._low_bytes_from_words(b"A\x00\x00\x00"),
-                         [ord("A")])
-
-    def test_several_words(self):
-        self.assertEqual(hw._low_bytes_from_words(_packet(1, 2, 3)),
-                         [1, 2, 3])
-
-    def test_short_read_keeps_first_byte(self):
-        self.assertEqual(hw._low_bytes_from_words(b"Z"), [ord("Z")])
-
-    def test_empty(self):
-        self.assertEqual(hw._low_bytes_from_words(b""), [])
+    """Byte-stream packet helper: bytes(bytes_) (no 4-byte padding)."""
+    return bytes(bytes_)
 
 
 class ReadAvailableTest(unittest.TestCase):
@@ -51,7 +34,7 @@ class ReadAvailableTest(unittest.TestCase):
     def test_empty_pipe_is_empty_list(self):
         self.assertEqual(hw.read_available(self.r), [])
 
-    def test_drains_every_queued_packet(self):
+    def test_drains_every_queued_byte(self):
         os.write(self.w, _packet(0x41, 0x42, 0x43, 0x44))
         self.assertEqual(hw.read_available(self.r),
                          [0x41, 0x42, 0x43, 0x44])
@@ -66,6 +49,33 @@ class ReadAvailableTest(unittest.TestCase):
         with mock.patch("os.read", side_effect=OSError(errno.EINVAL, "x")):
             self.assertEqual(hw.read_available(self.r), [])
             self.assertIsNone(hw.read_byte(self.r))
+
+    def test_multiple_writes_coalesce(self):
+        os.write(self.w, b"AB")
+        os.write(self.w, b"CD")
+        # read_available drains both writes in one call (pipe coalesce)
+        got = hw.read_available(self.r)
+        self.assertEqual(got, [ord("A"), ord("B"), ord("C"), ord("D")])
+
+    def test_write_byte_is_single_byte(self):
+        # hw.write_byte must be a 1-byte write (no 0x00 padding)
+        r2, w2 = os.pipe()
+        try:
+            hw.write_byte(w2, 0x5A)
+            os.close(w2)
+            # non-blocking read from r2 should get exactly 1 byte
+            os.set_blocking(r2, False)
+            data = os.read(r2, 16)
+            self.assertEqual(data, b"\x5A")
+        finally:
+            try:
+                os.close(r2)
+            except OSError:
+                pass
+            try:
+                os.close(w2)
+            except OSError:
+                pass
 
 
 class DrainAndTermTest(unittest.TestCase):
