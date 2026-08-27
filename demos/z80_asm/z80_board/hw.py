@@ -7,8 +7,8 @@ Provides:
     /dev/axi_byte_fifo_0x7c450000 (PS <-> PL byte bridge, 8-bit).
 
 Byte stream: one byte per TDATA beat, no TLAST/TLR/RLR packets.
-Legacy path /dev/axis_fifo_0x7c450000 is tried as fallback until the
-board has been re-imaged with the byte-FIFO bitstream+driver.
+Legacy path /dev/axis_fifo_0x7c450000 is tried as a rollback fallback for
+older board images; the current terminal uses the new device's POLLIN path.
 """
 
 import errno
@@ -42,7 +42,7 @@ RAM_SIZE = 56 * 1024     # 56K × 8 (Z80 addresses 0x2000–0xFFFF)
 # Z80 address of the first RAM byte (PS offset = Z80 addr - RAM_BASE)
 RAM_BASE = 0x2000
 
-# AXI-Stream FIFO device — byte FIFO (Phase 3), legacy kept as fallback
+# AXI-Stream FIFO device — byte FIFO (Phase 6), legacy kept as fallback
 FIFO_DEV = "/dev/axi_byte_fifo_0x7c450000"
 FIFO_DEV_LEGACY = "/dev/axis_fifo_0x7c450000"
 FIFO_BASE = 0x7C450000
@@ -229,10 +229,11 @@ def open_fifo(device: str | None = None) -> int:
     """Open the FIFO device for read/write (non-blocking from open).
 
     ``device`` defaults to ``FIFO_DEV`` with fallback to the legacy
-    ``FIFO_DEV_LEGACY`` (``/dev/axis_fifo_*`` packet FIFO) so a new
-    host tree still works against an old board image until Phase 4
-    atomic cutover.  An explicit ``/dev/axi_byte_fifo_*`` that is
-    missing also falls back to the legacy path.
+    ``FIFO_DEV_LEGACY`` (``/dev/axis_fifo_*`` packet FIFO) so rollback to
+    an older board image remains possible.  An explicit
+    ``/dev/axi_byte_fifo_*`` that is missing also falls back to the legacy
+    path.  ``cli._term_session`` uses ``fifo_poll_supported()`` to retain
+    timeout-draining when the legacy fallback is selected.
     """
     if device is None:
         device = FIFO_DEV
@@ -242,6 +243,20 @@ def open_fifo(device: str | None = None) -> int:
         if device == FIFO_DEV:
             return os.open(FIFO_DEV_LEGACY, os.O_RDWR | os.O_NONBLOCK)
         raise
+
+
+def fifo_poll_supported(fd: int) -> bool:
+    """Return whether ``fd`` is the new byte-FIFO device with ``poll()``.
+
+    The legacy ``axis_fifo`` driver deliberately had no ``f_op->poll``.
+    Keep the old timeout-drain behavior when the compatibility device is
+    selected; anonymous descriptors and test pipes default to poll support.
+    """
+    try:
+        target = os.path.basename(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        return True
+    return not target.startswith("axis_fifo_")
 
 
 def reset_fifo_buffers() -> None:
@@ -280,12 +295,10 @@ def write_byte(fd: int, b: int) -> None:
 def read_available(fd: int, max_bytes: int = 4096) -> list[int]:
     """Non-blocking drain of currently readable bytes.
 
-    Byte-stream FIFO: one byte per TDATA beat.  The new ``axi_byte_fifo``
-    driver exposes ``f_op->poll`` (Phase 2) but ``_term_session`` still
-    uses timeout-poll (Phase 3 keeps the old stdin-only polling loop;
-    switching to POLLIN on the FIFO fd is deferred to Phase 6, after
-    Phase 5 verification — see doc/AXI_BYTE_FIFO_PLAN.md).
-    A non-blocking ``read()`` is still the drain primitive.
+    Byte-stream FIFO: one byte per TDATA beat.  The ``axi_byte_fifo``
+    driver exposes ``f_op->poll``; ``cli._term_session`` registers the FIFO
+    for ``POLLIN`` and calls this non-blocking drain when it wakes.  A
+    non-blocking ``read()`` is still the drain primitive.
     """
     out: list[int] = []
     while len(out) < max_bytes:
@@ -331,12 +344,10 @@ def flush_fifo(fd, settle: float = 0.10) -> int:
         if now >= quiet_deadline:
             return discarded
 
-        # Phase 3 still uses timeout-poll (stdin-only poll loop in
-        # cli._term_session); the new axi_byte_fifo driver does expose
-        # f_op->poll, but switching the host to POLLIN on the FIFO fd
-        # is deferred to Phase 6 (after Phase 5 verification) per
-        # doc/AXI_BYTE_FIFO_PLAN.md.  Old axis_fifo had no poll at all
-        # (DEFAULT_POLLMASK), so waiting on it would spin.
+        # ``term`` uses the byte-FIFO driver's POLLIN wakeups for live
+        # output.  Keep this short sleep here because flush is also used
+        # during startup and must tolerate bytes already in the bridge;
+        # the legacy axis_fifo fallback has no useful poll implementation.
         timeout = min(0.005, quiet_deadline - now)
         if timeout > 0:
             time.sleep(timeout)

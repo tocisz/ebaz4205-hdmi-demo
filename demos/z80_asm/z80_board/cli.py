@@ -532,29 +532,52 @@ def _forward_stdin_to_fifo(stdin_fd: int, fifo_fd: int,
 
 
 def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
-                  poll_timeout_ms: int = 20) -> None:
+                  poll_timeout_ms: int = 20, fifo_poll: bool = True) -> None:
     """Bridge stdin/stdout to the AXI FIFO until Ctrl-] or EOF.
 
-    Phase 3 still uses timeout-poll: drain on every wake (including the
-    20 ms timeout) and poll stdin only.  The new ``axi_byte_fifo``
-    driver *does* expose ``f_op->poll`` (Phase 2), but switching the
-    host to POLLIN on the FIFO fd is deferred to Phase 6 (after Phase 5
-    verification) — see doc/AXI_BYTE_FIFO_PLAN.md.  Handles both
-    interactive ttys and piped input: when stdin is a pipe, POLLHUP /
-    POLLERR / POLLNVAL are treated as readable so the final bytes are
-    drained and EOF is detected.
+    The byte-FIFO driver's ``poll()`` reports ``POLLIN`` when ``RDFO`` is
+    non-zero.  Register both descriptors so output wakes the terminal
+    without a periodic 20 ms timeout.  ``poll_timeout_ms`` is retained as
+    a compatibility hook for callers/tests and for the legacy driver
+    fallback; with the new driver it is used only while the pipe-EOF
+    grace-period timer is running.  Handles both interactive ttys
+    and piped input: when stdin is a pipe, ``POLLHUP``/``POLLERR``/
+    ``POLLNVAL`` are treated as readable so the final bytes are drained and
+    EOF is detected.
     """
     global _last_was_cr
     _last_was_cr = False
     poll = select.poll()
     poll.register(stdin_fd, select.POLLIN)
+    if fifo_poll:
+        poll.register(fifo_fd, select.POLLIN)
     running = True
     stdin_closed = False
     pipe_idle_deadline: float | None = None
+    fifo_events = select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL
     while running:
-        events = poll.poll(poll_timeout_ms)
+        if stdin_closed:
+            # Once stdin reached EOF, the FIFO must be polled with a finite
+            # timeout so the quiet-period deadline can terminate the session.
+            # A FIFO POLLIN event resets that deadline below.
+            remaining = max(0.0, pipe_idle_deadline - time.monotonic())
+            timeout_ms = min(poll_timeout_ms, max(0, int(remaining * 1000)))
+        elif fifo_poll:
+            # In a TTY session this is an actual blocking poll.  Output from
+            # the Z80 is the wake-up; there is no 50 Hz timeout spin.
+            timeout_ms = -1
+        else:
+            # The old axis_fifo driver has no poll implementation.  Keep
+            # timeout polling only for the explicit legacy fallback.
+            timeout_ms = poll_timeout_ms
+
+        events = poll.poll(timeout_ms)
+        should_drain = not fifo_poll
         for fd, event in events:
-            if fd == stdin_fd and (event & (select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL)):
+            if fd == fifo_fd and (event & fifo_events):
+                should_drain = True
+            if fd == stdin_fd and (event & fifo_events):
+                should_drain = True
                 if stdin_closed:
                     continue
                 # Data may be ready even when HUP is set; try to forward.
@@ -571,7 +594,6 @@ def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
                         is_tty = False
                     if is_tty:
                         running = False
-                        break
                     else:
                         stdin_closed = True
                         pipe_idle_deadline = time.monotonic() + 0.5
@@ -579,16 +601,20 @@ def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
                             poll.unregister(stdin_fd)
                         except (OSError, AttributeError):
                             pass
-        drained = _drain_fifo_to(fifo_fd, stdout_fd)
+        # Drain on a descriptor event, including a detach/EOF event.  For
+        # the legacy fallback, ``should_drain`` is already true on every
+        # timeout because that driver has no FIFO readiness notification.
+        drained = _drain_fifo_to(fifo_fd, stdout_fd) if should_drain else 0
         if stdin_closed:
             # In pipe mode, linger until the Z80 has been quiet for
             # 0.5 s so the reply to the last piped line is not lost.
-            # The old code waited only one 20 ms period, which truncated
-            # the tail of `cat file | z80 term` (Z80 needs tens of ms
-            # to interpret the last line and emit OK / output).
+            # If the driver has no interrupt for a late response, the final
+            # timed wake still performs one drain before exiting.
             if drained:
                 pipe_idle_deadline = time.monotonic() + 0.5
             if pipe_idle_deadline is not None and time.monotonic() >= pipe_idle_deadline:
+                if not drained:
+                    _drain_fifo_to(fifo_fd, stdout_fd)
                 break
 
 
@@ -629,7 +655,8 @@ def _cmd_term(fifo_fd: int, opts: dict, quiet: bool) -> None:
         except termios.error:
             pass
         try:
-            _term_session(fifo_fd, stdin_fd, stdout_fd)
+            _term_session(fifo_fd, stdin_fd, stdout_fd,
+                          fifo_poll=hw.fifo_poll_supported(fifo_fd))
         finally:
             try:
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
@@ -646,7 +673,8 @@ def _cmd_term(fifo_fd: int, opts: dict, quiet: bool) -> None:
         # Pipe / non-tty mode: bridge stdin -> FIFO and FIFO -> stdout
         # without raw handling.  Useful for  z80 term < script.txt  or
         # echo "PRINT 1" | z80 term .
-        _term_session(fifo_fd, stdin_fd, stdout_fd)
+        _term_session(fifo_fd, stdin_fd, stdout_fd,
+                      fifo_poll=hw.fifo_poll_supported(fifo_fd))
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +906,9 @@ def legacy_main(argv: list[str]) -> int:
                     except termios.error:
                         pass
                     try:
-                        _term_session(fifo_fd, stdin_fd, stdout_fd)
+                        _term_session(
+                            fifo_fd, stdin_fd, stdout_fd,
+                            fifo_poll=hw.fifo_poll_supported(fifo_fd))
                     finally:
                         try:
                             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
@@ -891,7 +921,9 @@ def legacy_main(argv: list[str]) -> int:
                             except OSError:
                                 pass
                 else:
-                    _term_session(fifo_fd, stdin_fd, stdout_fd)
+                    _term_session(
+                        fifo_fd, stdin_fd, stdout_fd,
+                        fifo_poll=hw.fifo_poll_supported(fifo_fd))
             else:
                 # Batch mode: send input (if any), then capture output
                 if args.input:

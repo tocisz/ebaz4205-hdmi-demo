@@ -33,7 +33,7 @@ Hardware facts the new tool must keep:
 | CPU control | `axi_gpreg` `@0x7C440000` GP0 | `_HALT`, `_RESET`, `_RUN`, step, status bit 0 |
 | RAM | GP1, Z80 `0x2000–0xFFFF` | PS offset = Z80 addr − `0x2000` |
 | ROM | GP2, Z80 `0x0000–0x1FFF` | 8 KiB |
-| I/O stream | `/dev/axis_fifo_0x7c450000` | not cleared by CPU reset; use PG080 TDFR/RDFR `0xA5` |
+| I/O stream | `/dev/axi_byte_fifo_0x7c450000` | 8-bit byte stream; not cleared by CPU reset; use TDFR/RDFR `0xA5` (legacy `/dev/axis_fifo_*` fallback) |
 | Safe mem access | CPU **halted** | load/dump while running races the Z80 |
 
 `halt`/`run` are **pulses**, not sticky bits. There is no “leave RUN asserted”. After `run`, the CPU executes until it hits a Z80 `HALT` or we pulse `halt`/`reset`. `status()` only reports the core halt flag.
@@ -341,13 +341,15 @@ verification samples interior quartiles (not just ends); an image that
 writes nothing into the selected space errors instead of "succeeding";
 `term` exits on FIFO POLLHUP/POLLERR instead of hanging until Ctrl-].
 
-Term burst fix (post-board): the staging axis_fifo driver has no
-`f_op->poll`, so waiting for POLLIN on the device is meaningless — after a
+Term burst fix (post-board): the old staging `axis_fifo` driver had no
+`f_op->poll`, so waiting for POLLIN on the device was meaningless — after a
 large output burst the RX FIFO filled, the Z80 stalled on ACIA TDRE, and
 each keystroke (the only remaining wake-up) released exactly one more byte.
-`term` now polls stdin only (20 ms timeout) and drains every queued packet
-with non-blocking reads on each wake; reads use a 4096-byte buffer so a
-stuck RLR cannot wedge the FIFO with EINVAL.
+The new `axi_byte_fifo` driver reports FIFO readiness, and `term` now
+registers both stdin and the FIFO with `select.poll()`, draining every
+queued byte on a FIFO wake.  The normal TTY path blocks without a periodic
+20 ms wake; only the 0.5 s pipe-EOF grace period uses timed polls.  The
+write-side EAGAIN retry and 4096-byte non-blocking drain remain in place.
 
 Term UX fixes (2026-08-27, `z80_board/cli.py`):
 
@@ -366,8 +368,12 @@ Term UX fixes (2026-08-27, `z80_board/cli.py`):
   `LF 0x0A` → `CR 0x0D` (piped `\n` / Ctrl-J to monitor `CR`), `CRLF`
   collapsed to single `CR`; `CR`, `BEL 0x07`, `Ctrl-C 0x03`, `Ctrl-U`
   etc. pass through unchanged. Output is left raw (`PRNTCRLF` `CR LF`).
+- **Poll switch (2026-08-27)** – `term` registers stdin and the
+  `axi_byte_fifo` fd for `POLLIN`; FIFO-only output wakes the bridge and
+  idle TTY sessions block in `poll(-1)`.  Pipe EOF still gets a 0.5 s
+  quiet-period drain.  `test_fifo` covers registration and FIFO-only wake.
 - **Tests** – `test_term_without_tty_is_clean_error` → pipe-mode success;
-  `test_fifo` mock gains `unregister`; burst test still passes.
+  `test_fifo` mock gains `unregister`; byte-stream and poll tests pass.
 
 ---
 

@@ -157,7 +157,9 @@ Coverage: Intel HEX parsing (records, types 02/04, gaps, EOF, checksums),
 binary detection, chain splitting, `load`/`dump` handlers (boundaries,
 clipping, vector, fill, verify, force-halt, strict), and end-to-end `z80`
 invocations via `cli.main()` (state persistence, term-not-last rule, legacy
-compatibility, clean TTY error).
+compatibility, pipe mode).  FIFO tests also verify that `term` registers
+both stdin and the byte-FIFO descriptor with `select.poll()` and drains on a
+FIFO-only `POLLIN` wake.
 
 ## Architecture
 
@@ -167,7 +169,7 @@ SoC. The PS (ARM A9) communicates with the Z80 through:
 - **`ctrl_gp0`** (axi_gpreg @0x7C440000): CPU control — halt, run, step, reset
 - **`ctrl_gp1`** (axi_gpreg @0x7C440044): RAM access (56 KB, Z80 address 0x2000-0xFFFF; GP address is a zero-based offset)
 - **`ctrl_gp2`** (axi_gpreg @0x7C440084): ROM access (8 KB, Z80 address 0x0000-0x1FFF)
-- **`/dev/axis_fifo_0x7c450000`**: byte stream I/O — shared between the raw bridge (any port except 0x80-0x81) and the MC68B50 ACIA (ports 0x80-0x81)
+- **`/dev/axi_byte_fifo_0x7c450000`**: byte stream I/O — shared between the raw bridge (any port except 0x80-0x81) and the MC68B50 ACIA (ports 0x80-0x81); `term` uses its `POLLIN` readiness events
 
 ### Z80 I/O port map
 
@@ -251,11 +253,10 @@ Same as bf2_soc — see `doc/Z80_SOC_PLAN.md` or `doc/AXIS_FIFO_BRIDGE.md`.
    controls (`Ctrl-C`, `Ctrl-U`, `BEL`) pass through. Output is raw
    (`PRNTCRLF` `CR LF`). `term --flush` discards buffered output first.
    Note: `flush` cannot clear a stale byte already held in the ACIA RX
-   register. The loop drains the FIFO on every wake (keystroke or
-   20 ms timeout) — the axis_fifo driver has no poll support, so output
-   keeps flowing after large bursts without anyone typing. The banner is
-   printed before entering raw mode so the first Z80 line starts at
-   column 0.
+   register. The new byte-FIFO driver exposes `POLLIN`, so the terminal
+   drains queued output on FIFO readiness without a periodic 20 ms wake;
+   the legacy fallback retains timeout draining. The banner is printed
+   before entering raw mode so the first Z80 line starts at column 0.
 5. **New-style `run` ≠ legacy `run`**: on the board, `z80 run` resumes the
    CPU (no reset, no load). To restart from PC=0 use `z80 reset run`.
    `z80 run FILE.bin [options]` is the legacy one-shot compatibility path

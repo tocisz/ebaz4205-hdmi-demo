@@ -1,10 +1,8 @@
 """FIFO drain / term-bridge tests (no hardware).
 
-Byte-stream FIFO: one byte per TDATA beat.  The new axi_byte_fifo driver
-does expose f_op->poll, but Phase 3 still uses timeout-poll (stdin-only
-poll loop) — see doc/AXI_BYTE_FIFO_PLAN.md.  Term must still drain with
-non-blocking reads on every wake rather than waiting for POLLIN on the
-device (switch deferred to Phase 6, after Phase 5 verification).
+Byte-stream FIFO: one byte per TDATA beat.  ``term`` registers both stdin
+and the new ``axi_byte_fifo`` descriptor with ``select.poll()``; the FIFO
+readiness event drives output draining without a periodic timeout.
 """
 
 import errno
@@ -110,35 +108,34 @@ class DrainAndTermTest(unittest.TestCase):
                           poll_timeout_ms=5)
         self.assertEqual(os.read(self.out_r, 16), b"848")
 
-    def test_timeout_drains_without_keystroke(self):
+    def test_fifo_poll_event_drains_without_keystroke(self):
         os.write(self.fifo_w, _packet(*b"xyz"))
-        # First iteration: empty stdin poll + drain.  Then feed Ctrl-] so
-        # the session can exit.  This is the "PRINT 0..1000" case: output
-        # must keep flowing with nobody typing.
-        calls = {"n": 0}
-
-        real_poll = cli.select.poll
+        os.write(self.in_w, b"\x1d")
+        calls = []
+        events = [[(self.fifo_r, cli.select.POLLIN)],
+                  [(self.in_r, cli.select.POLLIN)]]
 
         class _Poll:
-            def register(self, *a, **k):
-                self._p = real_poll()
-                self._p.register(*a, **k)
+            def register(self, fd, mask):
+                calls.append(("register", fd, mask))
 
-            def unregister(self, *a, **k):
-                return self._p.unregister(*a, **k)
+            def unregister(self, fd):
+                calls.append(("unregister", fd))
 
             def poll(self, timeout=None):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return []          # timeout, no keystroke
-                return self._p.poll(timeout)
+                calls.append(("poll", timeout))
+                return events.pop(0)
 
-        with mock.patch("z80_board.cli.select.poll", _Poll):
-            os.write(self.in_w, b"\x1d")
+        with mock.patch("z80_board.cli.select.poll", _Poll), \
+                mock.patch("z80_board.cli.os.isatty", return_value=True):
             cli._term_session(self.fifo_r, self.in_r, self.out_w,
                               poll_timeout_ms=5)
+
         self.assertEqual(os.read(self.out_r, 16), b"xyz")
-        self.assertGreaterEqual(calls["n"], 1)
+        self.assertIn(("register", self.fifo_r, cli.select.POLLIN), calls)
+        self.assertIn(("register", self.in_r, cli.select.POLLIN), calls)
+        # The normal interactive wait is indefinite; no 20 ms timeout spin.
+        self.assertEqual(calls[2], ("poll", -1))
 
     def test_forward_ctrl_bracket_requests_stop(self):
         os.write(self.in_w, b"\x1d")

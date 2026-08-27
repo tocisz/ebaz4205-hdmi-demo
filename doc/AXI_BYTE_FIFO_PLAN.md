@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` + `VERIFICATION_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27; **Phase 5 (verification) DONE 2026-08-27** (HDL+kernel rebuilt + deployed, `todos2.f` clean, 100 OK). Old `axis-fifo` kept for rollback until Phase 6.
+**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` + `VERIFICATION_DONE` + `POLL_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27; Phase 5 (verification) DONE 2026-08-27 (HDL+kernel rebuilt + deployed, `todos2.f` clean, 100 OK); **Phase 6 (host poll switch) DONE 2026-08-27** (FIFO `POLLIN` wakeups, pipe linger preserved, 100 OK).
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -76,7 +76,7 @@ Register map after (from base `0x7C450000`):
 
 Mirror PL deletion — no length register, no word bounce, no `%4` guards. Old driver kept (Option A fork).
 
-- [x] Fork driver: `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5/6 (Option B rejected; now kept until Phase 6 poll switch per user request)
+- [x] Fork driver: `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback (Option B rejected)
 - [x] `axi-byte-fifo.c` (from `axis-fifo.c` 470 LOC, 19 KiB):
   - [x] `DRIVER_NAME "axi_byte_fifo"`, `of_match "xlnx,axi-byte-fifo-1.0"` (`xlnx,axi-fifo-mm-s-4.1` removed)
   - [x] Deleted `READ_BUF_SIZE`/`WRITE_BUF_SIZE`, `tmp_buf[128]` word bounce, `TDR`/`RDR`/`TLR`/`RLR` sysfs (kept `isr/ier/tdfr/tdfv/tdfd/rdfr/rdfo/rdfd/srr` only)
@@ -136,27 +136,28 @@ proves the byte FIFO + RTS + fallback in isolation.
 - [x] `make sdimg` **WNS +0.683 ns (TNS 0, WHS 0.023)** — no timing violation, `report_utilization` **Block RAM Tile 19.5/60 (32.5%)** — `axi_byte_fifo` 2 KiB (was 8 KiB, -75% BRAM, 1024×8b vs 1024×32b) — DT overlay `pl-ebaz4205.dtbo` 4.5K now `axi-byte-fifo@7C450000` `xlnx,axi-byte-fifo-1.0` 8-bit
 - [x] Delete old driver/PL alias after verification (keep until Phase 6 if poll switch wants fallback) — **kept**: `linux/drivers/staging/axis-fifo/` untouched, `hdl` `axi_byte_fifo` only; no dual `0x7C460000` alias
 
-### Phase 6 — Host `poll()` switch (after verification) — Status: `PENDING` (new — per user request)
+### Phase 6 — Host `poll()` switch (after verification) — Status: `DONE` 2026-08-27
 
 Switch the host from timeout-poll to honest `f_op->poll` **after**
-Phase 5 has proven the byte FIFO.  Deferred from Phase 3/5 so
-verification and rollback stay clean.
+Phase 5 proved the byte FIFO.  The terminal now waits on both stdin and
+FIFO readiness; the old EAGAIN retry remains the write-side backpressure
+fallback, and the pipe-EOF grace period retains its finite timer.
 
-- [ ] `demos/z80_asm/z80_board/cli.py:_term_session`: register FIFO fd
+- [x] `demos/z80_asm/z80_board/cli.py:_term_session`: register FIFO fd
   with `select.poll()` for `POLLIN` (`RDFO>0`) alongside stdin
-  `POLLIN`; replace the 20 ms timeout drain with poll-wake drain.
-  Keep stdin `POLLHUP/POLLERR/POLLNVAL` handling and 0.5 s pipe linger.
-  Optional: also `POLLOUT` (`TDFV`) for write-side backpressure
-  instead of the `EAGAIN` 1.0 s + 5 ms sleep loop, but keep that loop
-  as fallback until poll is proven.
-- [ ] `demos/z80_asm/z80_board/hw.py`: update `flush_fifo` /
-  `read_available` comments (no longer "no f_op->poll");
-  `capture_fifo_output` may optionally use poll.
-- [ ] `demos/z80_asm/tests/test_fifo.py`: add poll-aware tests
-  (mock `select.poll` returning `POLLIN` on FIFO fd).
-- [ ] Verification: `run_z80_tests.sh` still `100 OK`; hardware
-  `cat todos2.f | ssh ebaz z80 term` still clean but with lower CPU
-  (no 50 Hz wake); `strace -e poll` shows poll wait on FIFO fd.
+  `POLLIN`; drain only on descriptor events instead of a periodic 20 ms
+  timeout.  Keep stdin `POLLHUP/POLLERR/POLLNVAL` handling and 0.5 s pipe
+  linger.  The finite timeout is used only during pipe-EOF grace so a
+  non-interactive command can terminate after output goes quiet.
+- [x] `demos/z80_asm/z80_board/hw.py`: comments updated for the active
+  FIFO `poll()` path; `flush_fifo` retains short settle sleeps because it
+  is also used during startup and supports the legacy fallback.
+- [x] `demos/z80_asm/tests/test_fifo.py`: poll-aware test verifies FIFO
+  registration, FIFO-only output wake, and indefinite interactive poll.
+- [x] Verification: `run_z80_tests.sh` **100 OK**; `py_compile` clean;
+  on-board `strace -f -e poll` shows `poll([{fd=stdin}, {fd=fifo}], 2,
+  -1)` and `cat todos2.f | ssh ebaz z80 term` remains clean.  The normal
+  TTY path no longer wakes at 50 Hz while idle.
 
 ---
 
