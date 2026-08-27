@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` + `VERIFICATION_DONE` + `POLL_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27; Phase 5 (verification) DONE 2026-08-27 (HDL+kernel rebuilt + deployed, `todos2.f` clean, 100 OK); **Phase 6 (host poll switch) DONE 2026-08-27** (FIFO `POLLIN` wakeups, pipe linger preserved, 100 OK).
+**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` + `VERIFICATION_DONE` + `POLL_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27; Phase 5 (verification) DONE 2026-08-27 (HDL+kernel rebuilt + deployed, `todos2.f` clean, 100 OK); **Phase 6 (host poll switch) DONE 2026-08-27** (FIFO `POLLIN` wakeups, pipe linger preserved, 100 OK); **RX IRQ wake fix** DONE 2026-08-27 (sparse output now wakes `poll()` after FIFO idle).
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -60,8 +60,8 @@ Register map after (from base `0x7C450000`):
 
 | Off | Name | Access | New meaning |
 |-----|------|--------|-------------|
-| `0x00` | `ISR` | RO/W1C | unchanged (`0x01D00000` idle, `W1C`) |
-| `0x04` | `IER` | RW | stored, `interrupt=0` |
+| `0x00` | `ISR` | RO/W1C | unchanged (`0x01D00000` idle, `W1C`); `RC` (bit 26) latches on RX empty→non-empty |
+| `0x04` | `IER` | RW | enables the latched RX-data (`RC`, bit 26) interrupt; `interrupt = ISR & IER` |
 | `0x08` | `TDFR` | WO | `0xA5` resets TX (`tx_cnt/wptr/rptr`) |
 | `0x0C` | `TDFV` | RO | `DEPTH - tx_cnt` bytes free |
 | `0x10` | `TDFD` | WO | **one byte** `wdata[7:0]` → TX FIFO |
@@ -83,7 +83,7 @@ Mirror PL deletion — no length register, no word bounce, no `%4` guards. Old d
   - [x] `axi_byte_fifo_read`: `wait_event(read_queue, RDFO>0)`, `min(len,RDFO)` bytes, `kbuf[i]=ioread32(RDFD)&0xFF` → `copy_to_user`, return `to_read` (no `RLR` read, no `bytes_available%4`, no `words/4`)
   - [x] `axi_byte_fifo_write`: `wait_event(write_queue, TDFV>=len)`, `kmalloc(len)` → `copy_from_user` → `for (i<len) iowrite32(byte, TDFD)` — **no `TLR` commit**, return `len` (no `len%4` guard, `len>tx_fifo_depth` check now bytes → `len>DEPTH`)
   - [x] `axi_byte_fifo_parse_dt`: accept `xlnx,axi-str-*-tdata-width == 8` (was `32`), error message updated to "only supports 8 bits (byte FIFO)"
-  - [x] `fops.poll` (new): `poll_wait(read_queue/write_queue)`, `mask|=POLLIN|POLLRDNORM if RDFO`, `POLLOUT|POLLWRNORM if TDFV>=1` — fixes historic `f_op->poll==NULL` (§5c); added `#include <linux/poll.h>`
+  - [x] `fops.poll` (new): `poll_wait(read_queue/write_queue)`, `mask|=POLLIN|POLLRDNORM if RDFO`, `POLLOUT|POLLWRNORM if TDFV>=1` — fixes historic `f_op->poll==NULL` (§5c); added `#include <linux/poll.h>`; RX IRQ wake is supplied by the PL `RC` latch
   - [x] Kept `reset_ip_core` (`SRR/TDFR/RDFR` + `ISR/IER`), `misc_register` name `axi_byte_fifo_%pa` → `/dev/axi_byte_fifo_0x7c450000`, sysfs `ip_registers/{isr,ier,tdfr,tdfv,tdfd,rdfr,rdfo,rdfd,srr}` (no `tdr/rdlr/rlr`); added `wake_up_interruptible` after read/write for poll waiters; `MODULE_DESCRIPTION` updated to byte-stream
   - [x] Renamed internal symbols `axis_fifo*` → `axi_byte_fifo*` (`struct axi_byte_fifo`, `axi_byte_fifo_irq/open/close/read/write/poll/probe/remove/init/exit`, `axi_byte_fifo_attrs`, `DETECTION`)
 - [x] DTS: no manual edit — PL-generated DT from `system_bd.tcl` (`axi_byte_fifo_0 @0x7C450000`) will emit `compatible="xlnx,axi-byte-fifo-1.0"`, `xlnx,rx-fifo-depth=<1024>` (bytes) automatically on next `make sdimg`
@@ -179,6 +179,7 @@ fallback, and the pipe-EOF grace period retains its finite timer.
 | `u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso` still `axi-fifo@7C450000 xlnx,axi-fifo-mm-s-4.1 0x20` after PL rename | `ebaz_deploy.sh` deployed new bitstream but overlay still probed `axis_fifo` | Updated dtso to `axi-byte-fifo@7C450000 xlnx,axi-byte-fifo-1.0 0x08`, rebuilt `pl-ebaz4205.dtbo`, `scp` + `reboot` → `axi_byte_fifo` probe, `/dev/axi_byte_fifo_0x7c450000` |
 | `cat /sys/.../tdfv` shows `0x78305f6f` ("o_0x") not `0x400` | Phase 5 verification | HW correct (`devmem 0x7C45000C` = `0x400`); driver sysfs reads device-name string ("". `axi_byte_fifo` data path works (`todos2.f` clean) — sysfs bug to fix in follow-up |
 | `make sdimg` killed early (pid check) | Background `nohup make sdimg &` | Ran synchronous `make sdimg` to completion (BOOT 2.6M, uImage 4.1M, rootfs 1G) |
+| Interactive `term` stopped showing sparse Z80 output until a keypress | Phase 6 used `poll(-1)`, but PL `interrupt` was hardwired to `0`; the driver's `poll_wait()` queue was never woken after RX became non-empty | Added a latched RX `RC` event (`empty→non-empty`), `interrupt = ISR & IER`, and ISR-W1C handling in `axi_byte_fifo.sv`; deployed bitstream and verified `words`/`todos2.f` plus IRQ count on hardware |
 
 ## Notes
 

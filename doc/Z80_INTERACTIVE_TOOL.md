@@ -347,7 +347,9 @@ large output burst the RX FIFO filled, the Z80 stalled on ACIA TDRE, and
 each keystroke (the only remaining wake-up) released exactly one more byte.
 The new `axi_byte_fifo` driver reports FIFO readiness, and `term` now
 registers both stdin and the FIFO with `select.poll()`, draining every
-queued byte on a FIFO wake.  The normal TTY path blocks without a periodic
+queued byte on a FIFO wake.  The PL latches RX-data (`RC`) and asserts the
+mapped IRQ when an empty FIFO becomes non-empty, so a late/sparse response
+also wakes `poll()`.  The normal TTY path blocks without a periodic
 20 ms wake; only the 0.5 s pipe-EOF grace period uses timed polls.  The
 write-side EAGAIN retry and 4096-byte non-blocking drain remain in place.
 
@@ -372,6 +374,12 @@ Term UX fixes (2026-08-27, `z80_board/cli.py`):
   `axi_byte_fifo` fd for `POLLIN`; FIFO-only output wakes the bridge and
   idle TTY sessions block in `poll(-1)`.  Pipe EOF still gets a 0.5 s
   quiet-period drain.  `test_fifo` covers registration and FIFO-only wake.
+- **Sparse-output wake fix (2026-08-27)** – the byte FIFO PL previously
+  tied `interrupt` low, so its driver `poll_wait()` queue was never woken
+  when output arrived after the FIFO became empty.  `axi_byte_fifo` now
+  latches RX `RC` on empty→non-empty, asserts the mapped IRQ while `IER`
+  enables it, and clears it with the existing ISR W1C path.  This keeps
+  `poll(-1)` correct for delayed as well as continuous Z80 output.
 - **Tests** – `test_term_without_tty_is_clean_error` → pipe-mode success;
   `test_fifo` mock gains `unregister`; byte-stream and poll tests pass.
 
