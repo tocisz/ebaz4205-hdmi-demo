@@ -83,7 +83,7 @@ The HDMI expansion board plugs into the FPGA I/O headers and provides a standard
 | Ethernet | RGMII via EMIO | Standard kernel netdev |
 | NAND flash | SMCC controller | MTD subsystem |
 | UART | UART0 (EMIO header), UART1 (MIO 24-25 USB) | Serial console |
-| PL TTY (UART) | *(historical, removed)* AXI UART Lite (0x7C430000) → `uart_phy` → `bf2_soc` → see `doc/PL_TTY_DEVICE.md` | `/dev/ttyUL1` *(removed; use FIFO `/dev/axis_fifo_0x7c450000`)* |
+| PL TTY (UART) | *(historical, removed)* AXI UART Lite (0x7C430000) → `uart_phy` → `bf2_soc` → see `doc/PL_TTY_DEVICE.md` | `/dev/ttyUL1` *(removed; use FIFO `/dev/axi_byte_fifo_0x7c450000`, legacy `/dev/axis_fifo_0x7c450000`)* |
 
 > **Blinking LED**: The green expansion-board LED (`gpio_led_green`, GPIO0 pin 54 / EMIO bit 0, ball W13) blinks with the kernel's `heartbeat` trigger by default. It is the **only LED that blinks autonomously** — the kernel `gpio-leds` driver (with `CONFIG_LEDS_GPIO=y` and `CONFIG_LEDS_TRIGGER_HEARTBEAT=y`) picks up the `linux,default-trigger = "heartbeat"` from the device tree at boot. No HDL logic or userspace code is involved. The remaining LEDs (`gpio_led_red`, `gpio_led_aux_0/1/2` on GPIO 55-58) have `linux,default-state = "off"` and stay dark until explicitly controlled via `/sys/class/leds/`.
 
@@ -212,7 +212,7 @@ graph LR
     PS7 -->|80 MHz| GEN["hdmi_generator_0<br/>PLL + AXI-S→RGB"]
     PS7 -->|80 MHz| B2["z80_soc_0<br/>Z80/tv80 + ACIA"]
     PS7 -->|80 MHz| BRIDGE["axis_byte_bridge_0"]
-    PS7 -->|80 MHz| FIFO["axi_fifo_mm_s_0<br/>axi_fifo_lite (FIFO)"]
+    PS7 -->|80 MHz| FIFO["axi_byte_fifo_0<br/>axi_byte_fifo (8-bit byte FIFO)"]
 
     PS7 ==>|64b AXI-MM via HP0| DMA
     PS7 -.->|AXI-Lite @ 0x7C420000| DMA
@@ -228,8 +228,8 @@ graph LR
     HDMI -->|TMDS data 1| D1["hdmi_d1"]
     HDMI -->|TMDS data 2| D2["hdmi_d2"]
 
-    FIFO ==>|32b stream PS→PL| BRIDGE
-    BRIDGE ==>|32b stream PL→PS| FIFO
+    FIFO ==>|8b byte stream PS→PL| BRIDGE
+    BRIDGE ==>|8b byte stream PL→PS| FIFO
     BRIDGE <==>|byte handshake<br/>rx_data/rx_valid/rx_accept<br/>tx_data/tx_valid/tx_ready| B2
 
     CTRL -->|ctrl_gp_out 3b| B2
@@ -269,8 +269,8 @@ graph LR
 | `hdmi_0` | `hdmi` | — | TMDS 1.4b serializer → HDMI connector |
 | `z80_soc_0` | `z80_soc` (`tv80` + `acia68b50`) | — | Z80-compatible softcore (replaces `bf2_soc`); 8 KiB ROM `0x0000–0x1FFF`, 56 KiB RAM `0x2000–0xFFFF`, raw + ACIA `0x80/0x81` I/O |
 | `bf2_ctrl` | `axi_gpreg` | `0x7C440000` | 3-bit control gpreg for Z80 halt/run/step/reset (instance name kept for DT compat) |
-| `axi_fifo_mm_s_0` | `axi_fifo_lite` | `0x7C450000` irq ps-14 | AXI-Stream FIFO PS↔PL (behavioral drop-in for Xilinx `axi_fifo_mm_s`; fixes 1.9k-packet wedge — see `doc/Z80_FIFO_WEDGE_INVESTIGATION.md` §5b) |
-| `axis_byte_bridge_0` | `axis_byte_bridge` | — | 32-bit stream ↔ 8-bit byte handshake |
+| `axi_byte_fifo_0` | `axi_byte_fifo` | `0x7C450000` irq ps-14 | AXI byte-stream FIFO PS↔PL (8-bit TDATA, no TLAST/TLR/RLR, DEPTH=1024 B/dir; replaces `axi_fifo_mm_s` packet wedge — see `doc/AXI_BYTE_FIFO_PLAN.md` + `doc/Z80_FIFO_WEDGE_INVESTIGATION.md` §5b) |
+| `axis_byte_bridge_0` | `axis_byte_bridge` | — | 8-bit AXIS byte stream ↔ byte handshake (no TLAST — byte is atomic) |
 | `audio_sample_word_GND` | `xlconstant` | — | 16-bit zero tie-off for unused HDMI audio |
 
 ### PL resource utilization
@@ -281,7 +281,7 @@ Percentages are of the total available in the PL fabric.
 | Instance | LUTs | % LUT | FFs | % FF | BRAM36 | % BRAM | DSP | Notes |
 |---|---|---|---|---|---|---|---|---|
 | **System total** | **2800** | **15.9%** | **3103** | **8.8%** | **13** | **21.7%** | **0** | also 1 MMCM (50%), 4 BUFG (13%), 40 IOB (40%) |
-| `axi_fifo_mm_s_0` (`axi_fifo_lite`) | 746¹ | 4.2% | 667¹ | 1.9% | 2¹ | 3.3% | 0 | AXI-Stream FIFO — largest LUT consumer (¹ Xilinx IP; Lite is smaller) |
+| `axi_byte_fifo_0` (`axi_byte_fifo`) | 746¹ | 4.2% | 667¹ | 1.9% | 2¹ | 3.3% | 0 | AXI byte-stream FIFO — 8-bit, 75% BRAM saved vs 32b drop-24 (¹ Xilinx IP / Lite pre-byte; re-measure after byte rebuild) |
 | `axi_cpu_interconnect` | 543 | 3.1% | 676 | 1.9% | 0 | — | 0 | AXI interconnect + auto protocol converter |
 | `hdmi_sink_dma` | 429 | 2.4% | 565 | 1.6% | 1 | 1.7% | 0 | AXI DMAC — register map + transfer engine |
 | `hdmi_0` | 352 | 2.0% | 171 | 0.5% | 0 | — | 0 | TMDS 1.4b serializer (3 channels + packet assembler) |
@@ -380,8 +380,8 @@ This is [Sameer Puri's open-source HDMI 1.4b transmitter](https://github.com/hdl
 | IP Core | Origin | Role |
 |---|---|---|
 | `z80_soc` | Project (`hdl/library/z80_soc`) — `tv80` + `acia68b50` | Z80-compatible SoC; see `doc/Z80_SOC_PLAN.md` |
-| `axis_byte_bridge` | Project (`hdl/library/axis_byte_bridge`) | 32-bit AXIS word ↔ 8-bit byte handshake (TLAST per word) |
-| `axi_fifo_lite` | Project (`hdl/library/axi_fifo_lite`) | Behavioral drop-in for Xilinx `axi_fifo_mm_s` (PG080); fixes 1.9k-packet wedge at `TLAST=1` / 1024 depth; same `0x7C450000` map/IRQ as `axis_fifo.ko` expects |
+| `axis_byte_bridge` | Project (`hdl/library/axis_byte_bridge`) | 8-bit AXIS byte stream ↔ byte handshake (no TLAST — byte is atomic; RTS `rx_rts_n` gates `rx_valid`+`tready`) |
+| `axi_byte_fifo` | Project (`hdl/library/axi_byte_fifo`) | AXI byte-stream FIFO (8-bit TDATA, DEPTH=1024 B/dir, no TLAST/TLR/RLR; replaces `axi_fifo_mm_s`/`axi_fifo_lite` packet wedge; `0x7C450000` / `axi_byte_fifo.ko` / `xlnx,axi-byte-fifo-1.0`) |
 | `axi_gpreg` (`bf2_ctrl`) | Analog Devices | 3×32-bit GP regs for halt/run/step/reset + ROM/RAM byte access |
 
 #### Third-party IP used as-is
@@ -495,7 +495,7 @@ Key detail: `mwipcore@0` has **no `reg` property** — this was a deliberate des
 
 ### PL TTY character device (UART) — historical (removed)
 
-> **Removed.** The AXI UART Lite path (`/dev/ttyUL1` at `0x7C430000` via `uart_phy` → `bf2_soc`) was replaced by the **AXI-Stream FIFO bridge** (`axis_byte_bridge` + `axi_fifo_lite` at `0x7C450000`). The current PS↔PL console is `z80 term` over `/dev/axis_fifo_0x7c450000` (see `doc/AXIS_FIFO_BRIDGE.md` and `doc/Z80_INTERACTIVE_TOOL.md`). The section below is retained as a historical record; see `doc/PL_TTY_DEVICE.md` for the full story.
+> **Removed.** The AXI UART Lite path (`/dev/ttyUL1` at `0x7C430000` via `uart_phy` → `bf2_soc`) was replaced by the **AXI byte-stream FIFO bridge** (`axis_byte_bridge` + `axi_byte_fifo` at `0x7C450000`, 8-bit, no TLAST — see `doc/AXI_BYTE_FIFO_PLAN.md`). The current PS↔PL console is `z80 term` over `/dev/axi_byte_fifo_0x7c450000` (legacy fallback `/dev/axis_fifo_0x7c450000`; see `doc/AXIS_FIFO_BRIDGE.md` and `doc/Z80_INTERACTIVE_TOOL.md`). The section below is retained as a historical record; see `doc/PL_TTY_DEVICE.md` for the full story.
 
 Historically the design exposed a third serial channel to Linux: `/dev/ttyUL1`, backed by a Xilinx **AXI UART Lite** core in the PL (0x7C430000, IRQ 57). Its serial `tx`/`rx` wires connected to the **`uart_phy`** PHY — the same module used by the `bf2_soc` softcore — so Linux drove the softcore's UART as if it were an external UART:
 
@@ -518,7 +518,7 @@ own 16-byte TX FIFO is full — i.e. only at the wire baud rate (115200 ≈
 PS cannot detect. A long PS→PL stream while `bf2_soc` is not executing `,`
 therefore loses bytes silently. This limitation motivated the FIFO replacement. See [doc/PL_TTY_DEVICE.md](PL_TTY_DEVICE.md)
 for the full implementation and [doc/UART_PHY.md](UART_PHY.md) for the
-parallel-interface contract. Current `z80_soc` I/O is via the FIFO: `z80_soc` ↔ `axis_byte_bridge` ↔ `axi_fifo_lite` ↔ `/dev/axis_fifo_0x7c450000` ( polled `TDRE` on ACIA `0x80/0x81` or raw ports; no baud-rate bottleneck).
+parallel-interface contract. Current `z80_soc` I/O is via the FIFO: `z80_soc` ↔ `axis_byte_bridge` ↔ `axi_byte_fifo` ↔ `/dev/axi_byte_fifo_0x7c450000` (legacy `/dev/axis_fifo_0x7c450000` fallback until atomic cutover; polled `TDRE` on ACIA `0x80/0x81` or raw ports; 8-bit byte-stream, no baud-rate bottleneck).
 
 ### Kernel configuration highlights
 

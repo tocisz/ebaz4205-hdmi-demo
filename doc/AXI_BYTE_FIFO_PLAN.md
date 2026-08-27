@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean; `run_z80_tests.sh` 100 OK).
+**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean; `run_z80_tests.sh` 100 OK).
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -114,13 +114,13 @@ via fallback).
 - [x] `demos/z80_asm/tests/test_fifo.py`: `_packet(*bytes_)` → `bytes(bytes_)`, removed `LowBytesTest` (word-alignment), kept drain/term tests, added `test_multiple_writes_coalesce` + `test_write_byte_is_single_byte`; `run_z80_tests.sh` **100 OK**
 - [x] `demos/z80_asm/install_to_board.sh`: (no change needed for Phase 3 — `z80_board/hw.py`+`cli.py` already uploaded; kernel `.ko` install deferred to Phase 4 atomic deploy)
 
-### Phase 4 — Integration wiring — Status: `PENDING`
+### Phase 4 — Integration wiring — Status: `DONE` 2026-08-27
 
-- [ ] Choose cutover strategy:
-  - **Atomic** (recommended): one `./scripts/ebaz_deploy.sh` run programs new bitstream + `rmmod axis_fifo; insmod axi_byte_fifo` + `install_to_board.sh` — old device path disappears on next reboot. Keep this plan as rollback reference.
-  - **Dual** (intermediate): new PL exposes *both* `0x7C450000` (new 8-bit) and old 32-bit alias at `0x7C460000` — not recommended, doubles BRAM.
-- [ ] `hdl/projects/ebaz4205/system_bd.tcl`: finalize instance name `axi_byte_fifo_0` vs keeping `axi_fifo_mm_s_0` alias for old DT — pick one after name ACK
-- [ ] `ADDRESS_MAP.md` / `doc/ARCHITECTURE.md` / `doc/PL_TTY_DEVICE.md` note new device path
+- [x] Choose cutover strategy: **Atomic** (selected) — one `./scripts/ebaz_deploy.sh` run programs new bitstream + `rmmod axis_fifo; insmod axi_byte_fifo` + `install_to_board.sh` — old device path disappears on next reboot. Keep this plan as rollback reference. Dual (both `0x7C450000` 8-bit + `0x7C460000` 32-bit alias) rejected — doubles BRAM for no benefit.
+- [x] `hdl/projects/ebaz4205/system_bd.tcl`: finalized instance name `axi_byte_fifo_0` (was `axi_fifo_mm_s_0`) @`0x7C450000` — done in Phase 1 (`ad_ip_instance axi_byte_fifo axi_byte_fifo_0`, `axi_byte_fifo_0/s_axi_aclk`, `ad_cpu_interconnect 0x7C450000`, `AXI_STR_TXD/RXD` 8-bit, `ad_connect rts_n→rx_rts_n`); DT `compatible="xlnx,axi-byte-fifo-1.0"` will auto-emit on next `make sdimg`
+- [x] `doc/ARCHITECTURE.md` updated: FIFO instance/table → `axi_byte_fifo_0`/`axi_byte_fifo`, 8-bit TDATA no TLAST, `/dev/axi_byte_fifo_0x7c450000` (legacy fallback `/dev/axis_fifo_0x7c450000`), Mermaid 32b→8b, `axis_byte_bridge` 8-bit byte-stream, `axi_byte_fifo` project IP row, resource table BRAM note; PL_TTY historical section → `axi_byte_fifo`
+- [x] `ADDRESS_MAP.md` — no file in tree (address map lives in `hdl/projects/ebaz4205/system_bd.tcl` + `doc/AXI_BYTE_FIFO_PLAN.md` register map); nothing to update
+- [x] Host fallback verified: `demos/z80_asm/z80_board/hw.py` + `demos/brainfuck_org/run_bf1_program.py` `open_fifo` falls back `FIFO_DEV→FIFO_DEV_LEGACY` so new host tree runs against old board image until atomic cutover
 
 ### Phase 5 — Verification (byte FIFO, timeout-poll) — Status: `PENDING`
 
