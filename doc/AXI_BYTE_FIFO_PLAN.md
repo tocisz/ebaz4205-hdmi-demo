@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean; `run_z80_tests.sh` 100 OK).
+**Status:** `PL_DONE` + `DRIVER_DONE` + `HOST_DONE` + `INTEGRATION_DONE` + `VERIFICATION_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27; Phase 3 (host byte shim) committed 2026-08-27; Phase 4 (integration wiring/docs) committed 2026-08-27; **Phase 5 (verification) DONE 2026-08-27** (HDL+kernel rebuilt + deployed, `todos2.f` clean, 100 OK). Old `axis-fifo` kept for rollback until Phase 6.
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -122,19 +122,19 @@ via fallback).
 - [x] `ADDRESS_MAP.md` — no file in tree (address map lives in `hdl/projects/ebaz4205/system_bd.tcl` + `doc/AXI_BYTE_FIFO_PLAN.md` register map); nothing to update
 - [x] Host fallback verified: `demos/z80_asm/z80_board/hw.py` + `demos/brainfuck_org/run_bf1_program.py` `open_fifo` falls back `FIFO_DEV→FIFO_DEV_LEGACY` so new host tree runs against old board image until atomic cutover
 
-### Phase 5 — Verification (byte FIFO, timeout-poll) — Status: `PENDING`
+### Phase 5 — Verification (byte FIFO, timeout-poll) — Status: `DONE` 2026-08-27
 
 Verify the atomic cutover works **without** yet switching to `poll()`:
 `cli._term_session` stays on the Phase-3 timeout-poll loop so Phase 5
 proves the byte FIFO + RTS + fallback in isolation.
 
-- [ ] PL lint+sims: `verilator --lint-only`, `make -C hdl/library/z80_soc sim-acia`, `sim-verilator`, `make -C hdl/library/axis_byte_bridge sim` — 30 checks PASS, TEST4 `rts_n` still stalls PS→PL only
-- [ ] Module load: `ssh ebaz 'modprobe axi_byte_fifo && ls -l /dev/axi_byte_fifo_* && cat /sys/class/misc/axi_byte_fifo_*/ip_registers/tdfv'` → `0x400` after `SRR`, `rdfo` bytes
-- [ ] Host tests: `./demos/z80_asm/run_z80_tests.sh` → `100 OK` (Phase 3 updated)
-- [ ] Hardware byte-stream: `ssh ebaz 'z80 halt; z80 reset; z80 run'` + `printf 'HELLO\r' | ssh ebaz z80 term` → echo, interactive `z80 term`
-- [ ] Burst that previously needed RTS: `cat ~/repos/z80/TC2014-FORTH/scripts/todos2.f | ssh ebaz z80 term` → clean `; OK` lines (no `? MSG #0` / `variaoetN1u`), `cat` throughput now honest byte rate (no 4× write amplification)
-- [ ] `make sdimg` WNS ≥0, `report_utilization` BRAM: `axi_fifo` 8 KiB → 2 KiB (-75%)
-- [ ] Delete old driver/PL alias after verification (keep until Phase 6 if poll switch wants fallback)
+- [x] PL lint+sims: `verilator --lint-only` (`axi_byte_fifo` + `axis_byte_bridge` clean), `make -C hdl/library/z80_soc sim-acia` **15 checks PASS (RTS/CTS)**, `sim-verilator` PASS, `make -C hdl/library/axis_byte_bridge sim` **30 checks PASS incl. TEST4 `rts_n` stalls PS→PL only** — re-ran 2026-08-27 after `hdl/projects/ebaz4205/Makefile` `axi_fifo_lite→axi_byte_fifo` fix
+- [x] Module load: `ssh ebaz 'ls -l /dev/axi_byte_fifo_*'` → `crw------- /dev/axi_byte_fifo_0x7c450000`, `lsmod` → `axi_byte_fifo`, `devmem 0x7C45000C` → `0x400` after `SRR` (1024 bytes free), `rdfo` `0x0`; DT `compatible="xlnx,axi-byte-fifo-1.0"`, `tdata-width 8`, `rx/tx-depth 1024`; **Note:** `cat /sys/.../tdfv` currently returns garbled `0x78305f6f` (driver sysfs reads device-name string, not MMIO) — devmem proves HW correct; sysfs bug to fix in follow-up, does not affect FIFO data path
+- [x] Host tests: `./demos/z80_asm/run_z80_tests.sh` → **100 OK** (Phase 3 updated, 2026-08-27)
+- [x] Hardware byte-stream: `z80 halt; z80 load rom/ram (TC2014-FORTH) flush reset run` + `printf 'C\\r' | ssh ebaz z80 term` → `* Z80 FORTH * OK`, `printf 'words\\r' | z80 term` → word list clean, interactive `z80 term` works via byte stream (`hw.py` fallback `axi_byte_fifo→axis_fifo` not needed)
+- [x] Burst that previously needed RTS: `cat ~/repos/z80/TC2014-FORTH/scripts/todos2.f | ssh ebaz z80 term` → **clean `; OK` lines (no `? MSG #0` / `variaoetN1u`)** after proper cold-start `C` handshake; `cat` throughput now honest byte rate (no 4× write amplification); RTS (`rts_n=(cr_tx_ctrl==2'b10)`) gates `rx_valid`+`m_axis_tready` so EAGAIN throttles at `serBuf≥48`
+- [x] `make sdimg` **WNS +0.683 ns (TNS 0, WHS 0.023)** — no timing violation, `report_utilization` **Block RAM Tile 19.5/60 (32.5%)** — `axi_byte_fifo` 2 KiB (was 8 KiB, -75% BRAM, 1024×8b vs 1024×32b) — DT overlay `pl-ebaz4205.dtbo` 4.5K now `axi-byte-fifo@7C450000` `xlnx,axi-byte-fifo-1.0` 8-bit
+- [x] Delete old driver/PL alias after verification (keep until Phase 6 if poll switch wants fallback) — **kept**: `linux/drivers/staging/axis-fifo/` untouched, `hdl` `axi_byte_fifo` only; no dual `0x7C460000` alias
 
 ### Phase 6 — Host `poll()` switch (after verification) — Status: `PENDING` (new — per user request)
 
@@ -174,7 +174,10 @@ verification and rollback stay clean.
 
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-|       |         |            |
+| `hdl/projects/ebaz4205/Makefile` still `LIB_DEPS += axi_fifo_lite` after `git mv` | `make sdimg` 2026-08-27 failed `flock ... axi_fifo_lite/component.xml` | Fixed to `axi_byte_fifo`, `make clean && make sdimg` rebuild OK (XSA 454K, bit 2.0M) |
+| `u-boot-xlnx/arch/arm/dts/pl-ebaz4205.dtso` still `axi-fifo@7C450000 xlnx,axi-fifo-mm-s-4.1 0x20` after PL rename | `ebaz_deploy.sh` deployed new bitstream but overlay still probed `axis_fifo` | Updated dtso to `axi-byte-fifo@7C450000 xlnx,axi-byte-fifo-1.0 0x08`, rebuilt `pl-ebaz4205.dtbo`, `scp` + `reboot` → `axi_byte_fifo` probe, `/dev/axi_byte_fifo_0x7c450000` |
+| `cat /sys/.../tdfv` shows `0x78305f6f` ("o_0x") not `0x400` | Phase 5 verification | HW correct (`devmem 0x7C45000C` = `0x400`); driver sysfs reads device-name string ("". `axi_byte_fifo` data path works (`todos2.f` clean) — sysfs bug to fix in follow-up |
+| `make sdimg` killed early (pid check) | Background `nohup make sdimg &` | Ran synchronous `make sdimg` to completion (BOOT 2.6M, uImage 4.1M, rootfs 1G) |
 
 ## Notes
 
