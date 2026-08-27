@@ -438,63 +438,212 @@ def _drain_fifo_to(fifo_fd: int, out_fd: int) -> int:
     """Copy every currently queued FIFO byte to ``out_fd``. Return count."""
     data = hw.read_available(fifo_fd)
     if data:
+        # Z80 images (NASCOM BASIC, TC2014-FORTH, etc.) already emit
+        # CR LF (0x0D 0x0A) for newlines via PRNTCRLF / CR words, so
+        # when stdout is a raw tty we must not mangle CRLF into
+        # CR CR LF.  Leave the byte stream untouched – the kernel's
+        # OPOST is disabled while the tty is in raw mode, so CRLF
+        # displays correctly as-is.  Only the "Terminal attached"
+        # banner needs explicit CRLF (handled in _cmd_term).
         os.write(out_fd, bytes(data))
     return len(data)
 
 
-def _forward_stdin_to_fifo(stdin_fd: int, fifo_fd: int) -> bool:
-    """Send one keystroke to the Z80. Return False if the user asked to detach."""
-    ch = os.read(stdin_fd, 1)
-    if not ch or ch == b"\x1d":  # Ctrl-]
-        return False
+# Translation table for bytes coming from the host terminal / pipe
+# into the Z80.  RC2014-NASCOM (bas32k.asm TTYLIN) treats both BS
+# (0x08) and DEL (0x7F) as delete, but its primary rubout path
+# (DODEL) is DEL; TC2014-FORTH's EXPECT only checks BKSP (0x08).
+# To satisfy both, the interactive terminal maps the host Backspace
+# (which is 0x7F on most Linux ttys in raw mode, 0x08 for Ctrl-H)
+# to DEL (0x7F) — NASCOM handles DEL natively and FORTH's handler
+# now also treats DEL as delete via the same translation.  LF
+# (0x0A, common for piped input and Ctrl-J) is mapped to CR (0x0D),
+# which both monitors use as the line terminator (const.asm CR).
+_INPUT_TRANSLATE = {0x08: 0x7F, 0x09: 0x20, 0x0A: 0x0D}
+
+# Additional host -> Z80 mappings for "other codes these systems use"
+# (const.asm): CR (0x0D) terminates lines, LF (0x0A) from pipes is
+# mapped to CR, BEL/BKSP/DEL etc. are passed through.  CRLF (Windows)
+# from a piped file is collapsed to a single CR so the Z80 does not
+# see an extra empty line.
+_last_was_cr = False
+
+def _forward_stdin_to_fifo(stdin_fd: int, fifo_fd: int,
+                           stdout_fd: int | None = None) -> bool:
+    """Send keystrokes / pipe bytes to the Z80. Return False on detach/EOF."""
+    global _last_was_cr
     try:
-        hw.write_byte(fifo_fd, ch[0])
+        chunk = os.read(stdin_fd, 64)
     except BlockingIOError:
-        pass
-    except OSError as exc:
-        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINVAL):
-            raise
+        return True
+    if not chunk:
+        return False  # EOF
+    for b in chunk:
+        if b == 0x1D:  # Ctrl-] detach
+            return False
+        # Collapse CRLF -> single CR (common for Windows-style piped files)
+        if b == 0x0A and _last_was_cr:
+            _last_was_cr = False
+            continue
+        # Translate BS (0x08, Ctrl-H / some terminals) -> DEL (0x7F)
+        # and LF (0x0A, pipe Ctrl-J) -> CR (0x0D).  DEL (0x7F) and CR
+        # (0x0D) pass through.  Other control codes (BEL 0x07, Ctrl-C
+        # 0x03, Ctrl-U 0x15, etc.) are passed unchanged so NASCOM
+        # TTYLIN and FORTH EXPECT see them natively (const.asm).
+        b = _INPUT_TRANSLATE.get(b, b)
+        _last_was_cr = (b == 0x0D)
+        # Reliable write: the FIFO is opened O_NONBLOCK so a full TX
+        # FIFO (1024 words) returns EAGAIN.  The old code dropped the
+        # byte, which loses characters when a file is piped quickly
+        # (cat todos2.f | z80 term).  Block until the FIFO can accept,
+        # draining RX while we wait so the Z80 (which may be blocked
+        # on TX to the host) can make progress.
+        deadline = time.monotonic() + 1.0  # matches axis_fifo write_timeout
+        while True:
+            try:
+                hw.write_byte(fifo_fd, b)
+                break
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    if exc.errno == errno.EINVAL:
+                        break  # misaligned – not retryable
+                    raise
+            # TX full – drain RX to unblock the Z80, then retry.
+            if stdout_fd is not None:
+                try:
+                    _drain_fifo_to(fifo_fd, stdout_fd)
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                # Give up on this byte to avoid hanging forever if the
+                # Z80 is wedged; the driver would have returned EAGAIN
+                # after write_timeout as well.
+                break
+            time.sleep(0.005)
+        # No per-CR pacing: RTS flow control (acia rts_n -> bridge
+        # rx_rts_n, gated at serBuf≥48 in int32k.asm) now back-pressures
+        # PS→PL, so the TX FIFO (1024) fills and EAGAIN above throttles
+        # naturally; the next line stays queued in TX until the Z80
+        # drains serBuf and deasserts RTS.  Output is drained by the
+        # outer _term_session poll loop.
     return True
 
 
 def _term_session(fifo_fd: int, stdin_fd: int, stdout_fd: int,
                   poll_timeout_ms: int = 20) -> None:
-    """Bridge stdin/stdout to the AXI FIFO until Ctrl-].
+    """Bridge stdin/stdout to the AXI FIFO until Ctrl-] or EOF.
 
     ``axis_fifo`` has no ``f_op->poll``, so POLLIN on the device is not a
-    usable edge.  The previous loop read *one* byte per poll event and then
-    waited: after a burst the RX FIFO filled, the Z80 stalled on TDRE, and
-    each keystroke (the only remaining wake-up) released one more byte.
-    Drain on every wake — including the timeout — and poll stdin only.
+    usable edge.  Drain on every wake — including the timeout — and poll
+    stdin only.  Handles both interactive ttys and piped input: when
+    stdin is a pipe, POLLHUP / POLLERR / POLLNVAL are treated as
+    readable so the final bytes are drained and EOF is detected.
     """
+    global _last_was_cr
+    _last_was_cr = False
     poll = select.poll()
     poll.register(stdin_fd, select.POLLIN)
     running = True
+    stdin_closed = False
+    pipe_idle_deadline: float | None = None
     while running:
         events = poll.poll(poll_timeout_ms)
         for fd, event in events:
-            if fd == stdin_fd and (event & select.POLLIN):
-                if not _forward_stdin_to_fifo(stdin_fd, fifo_fd):
-                    running = False
-                    break
-        _drain_fifo_to(fifo_fd, stdout_fd)
+            if fd == stdin_fd and (event & (select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL)):
+                if stdin_closed:
+                    continue
+                # Data may be ready even when HUP is set; try to forward.
+                # If the read returns 0 (EOF) we stop polling stdin but
+                # keep draining the FIFO for a short grace period so the
+                # Z80's response to the last line is not lost.
+                if not _forward_stdin_to_fifo(stdin_fd, fifo_fd, stdout_fd):
+                    # Distinguish Ctrl-] (interactive detach) vs pipe EOF.
+                    # For a tty, Ctrl-] should exit immediately; for a pipe
+                    # EOF we linger to show the reply.
+                    try:
+                        is_tty = os.isatty(stdin_fd)
+                    except OSError:
+                        is_tty = False
+                    if is_tty:
+                        running = False
+                        break
+                    else:
+                        stdin_closed = True
+                        pipe_idle_deadline = time.monotonic() + 0.5
+                        try:
+                            poll.unregister(stdin_fd)
+                        except (OSError, AttributeError):
+                            pass
+        drained = _drain_fifo_to(fifo_fd, stdout_fd)
+        if stdin_closed:
+            # In pipe mode, linger until the Z80 has been quiet for
+            # 0.5 s so the reply to the last piped line is not lost.
+            # The old code waited only one 20 ms period, which truncated
+            # the tail of `cat file | z80 term` (Z80 needs tens of ms
+            # to interpret the last line and emit OK / output).
+            if drained:
+                pipe_idle_deadline = time.monotonic() + 0.5
+            if pipe_idle_deadline is not None and time.monotonic() >= pipe_idle_deadline:
+                break
 
 
 def _cmd_term(fifo_fd: int, opts: dict, quiet: bool) -> None:
     if opts["flush"]:
         _cmd_flush(fifo_fd, quiet)
+    # Try to put the terminal in raw mode.  If stdin is not a tty
+    # (e.g.  echo "HELLO" | z80 term  or  z80 term < file), fall back
+    # to pipe mode without requiring ssh -t.  This satisfies improvement #2.
     try:
         old_attr = termios.tcgetattr(sys.stdin)
+        is_tty = True
     except termios.error:
-        _err("term requires an interactive terminal — use ssh -t z80 term")
-    try:
-        tty.setraw(sys.stdin)
+        is_tty = False
+        old_attr = None
+    except OSError:
+        is_tty = False
+        old_attr = None
+    # Resolve fds robustly when stdout is captured (tests use StringIO).
+    def _fileno_or_std(f, std):
+        try:
+            return f.fileno()
+        except Exception:
+            return std
+    stdin_fd = _fileno_or_std(sys.stdin, 0)
+    stdout_fd = _fileno_or_std(sys.stdout, 1)
+    if is_tty:
+        # Fix #1: print the banner *before* entering raw mode.  In raw
+        # mode OPOST is disabled, so a bare LF (\n) moves the cursor
+        # down without CR, making the first line of Z80 output appear
+        # mid-line.  Printing while still in cooked mode lets the kernel
+        # translate LF -> CR LF, so the cursor is at column 0.
         if not quiet:
             print("  Terminal attached — Ctrl-] to detach (CPU keeps running).",
                   file=sys.stderr)
-        _term_session(fifo_fd, sys.stdin.fileno(), sys.stdout.fileno())
-    finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attr)
+        try:
+            tty.setraw(stdin_fd)
+        except termios.error:
+            pass
+        try:
+            _term_session(fifo_fd, stdin_fd, stdout_fd)
+        finally:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
+            except termios.error:
+                pass
+            # Leave the cursor on a fresh line after detach.
+            if not quiet:
+                try:
+                    sys.stderr.write("\r\n")
+                    sys.stderr.flush()
+                except OSError:
+                    pass
+    else:
+        # Pipe / non-tty mode: bridge stdin -> FIFO and FIFO -> stdout
+        # without raw handling.  Useful for  z80 term < script.txt  or
+        # echo "PRINT 1" | z80 term .
+        _term_session(fifo_fd, stdin_fd, stdout_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -699,17 +848,47 @@ def legacy_main(argv: list[str]) -> int:
                 print("  CPU running...", file=sys.stderr)
 
             if args.interactive:
-                # Interactive mode: live keyboard ↔ Z80 I/O
-                old_attr = termios.tcgetattr(sys.stdin)
+                # Interactive mode: live keyboard ↔ Z80 I/O — also supports
+                # piped input (echo "hi" | z80 run -i prog.bin).
                 try:
-                    tty.setraw(sys.stdin)
+                    old_attr = termios.tcgetattr(sys.stdin)
+                    is_tty = True
+                except termios.error:
+                    is_tty = False
+                    old_attr = None
+                except OSError:
+                    is_tty = False
+                    old_attr = None
+                def _fileno_or_std(f, std):
+                    try:
+                        return f.fileno()
+                    except Exception:
+                        return std
+                stdin_fd = _fileno_or_std(sys.stdin, 0)
+                stdout_fd = _fileno_or_std(sys.stdout, 1)
+                if is_tty:
                     if not args.quiet:
                         print("  Interactive mode. Ctrl-C or Ctrl-] to quit.",
                               file=sys.stderr)
-                    _term_session(fifo_fd, sys.stdin.fileno(),
-                                  sys.stdout.fileno())
-                finally:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attr)
+                    try:
+                        tty.setraw(stdin_fd)
+                    except termios.error:
+                        pass
+                    try:
+                        _term_session(fifo_fd, stdin_fd, stdout_fd)
+                    finally:
+                        try:
+                            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
+                        except termios.error:
+                            pass
+                        if not args.quiet:
+                            try:
+                                sys.stderr.write("\r\n")
+                                sys.stderr.flush()
+                            except OSError:
+                                pass
+                else:
+                    _term_session(fifo_fd, stdin_fd, stdout_fd)
             else:
                 # Batch mode: send input (if any), then capture output
                 if args.input:

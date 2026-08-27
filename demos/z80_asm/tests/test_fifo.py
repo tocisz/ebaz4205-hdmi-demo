@@ -114,6 +114,9 @@ class DrainAndTermTest(unittest.TestCase):
                 self._p = real_poll()
                 self._p.register(*a, **k)
 
+            def unregister(self, *a, **k):
+                return self._p.unregister(*a, **k)
+
             def poll(self, timeout=None):
                 calls["n"] += 1
                 if calls["n"] == 1:

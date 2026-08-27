@@ -90,9 +90,15 @@ Sparse IHEX: only write listed bytes. Do **not** zero the whole bank unless `--f
 z80 term
 z80 term --flush          # discard FIFO before attach (default: keep buffer)
 z80 term --no-flush       # explicit keep
+# pipe / non-tty also works:
+echo "HELLO" | z80 term
+z80 term < script.txt
 ```
 
-- Raw TTY, same quit keys as today: **Ctrl-]** or restore on SIGINT.
+- When stdin is a TTY: raw mode, quit with **Ctrl-]** (or restore on SIGINT). Banner `Terminal attached …` is printed *before* entering raw mode so `OPOST` still translates `LF` → `CR LF` and the cursor is at column 0 for the first Z80 line (fixes pre-2026-08-27 banner `\n` without `\r`).
+- When stdin is not a TTY (pipe/file, e.g. `echo … | z80 term`): no raw mode, no `ssh -t` required. Stdin is bridged in 64-byte chunks; `POLLHUP` is treated as readable so the last line is not lost. After EOF the FIFO is drained for one quiet poll period before exit.
+- Input translation (host → Z80, `const.asm` codes for RC2014-NASCOM / TC2014-FORTH): `BS 0x08` (Ctrl-H / some terminals) → `DEL 0x7F` (NASCOM `DODEL` primary rubout; FORTH `EXPECT` also treated as delete), `LF 0x0A` (piped `\n`, Ctrl-J) → `CR 0x0D` (both monitors terminate lines with `CR`), `CRLF` from Windows files collapsed to single `CR`; `CR 0x0D`, `BEL 0x07`, `Ctrl-C 0x03`, `Ctrl-U 0x15` etc. passed through unchanged.
+- Output is the raw FIFO byte stream (Z80 `PRNTCRLF` already emits `CR LF`). No `OPOST` mangling, so `CR LF` stays `CR LF`.
 - `--flush` is the “discard buffer” option. Default **keep** so a just-started program’s banner is not lost.
 - `term` must be the **last** verb in a chain (it is interactive and blocking).
 - Do **not** halt on exit. The CPU keeps running; the next `z80` invocation can dump RAM or re-attach.
@@ -342,6 +348,26 @@ each keystroke (the only remaining wake-up) released exactly one more byte.
 `term` now polls stdin only (20 ms timeout) and drains every queued packet
 with non-blocking reads on each wake; reads use a 4096-byte buffer so a
 stuck RLR cannot wedge the FIFO with EINVAL.
+
+Term UX fixes (2026-08-27, `z80_board/cli.py`):
+
+- **Banner cursor** – `term` banner `Terminal attached …` is now printed
+  *before* `tty.setraw()` (cooked `OPOST` → `LF` to `CR LF`) and a
+  `\r\n` is emitted on detach, so the first Z80 line starts at column 0
+  instead of mid-line after a bare `\n` in raw mode.
+- **Pipe mode** – `term` no longer requires a TTY (`ssh -t`). When
+  `stdin` is not a tty, `cli._cmd_term` skips raw mode and bridges
+  `stdin` (64-byte chunks, `POLLHUP` handled) to the FIFO and FIFO to
+  `stdout`. After `EOF` the FIFO is drained for one quiet poll period
+  before exit, so `echo "HELLO" | z80 term` and `z80 term < script` work.
+  Both `term` and legacy `run -i` share the same path.
+- **Input translation** – host `BS 0x08` → `DEL 0x7F` (RC2014-NASCOM
+  `DODEL`/`DELCHR`, TC2014-FORTH `EXPECT`/`BKSP`/`DEL` in `const.asm`),
+  `LF 0x0A` → `CR 0x0D` (piped `\n` / Ctrl-J to monitor `CR`), `CRLF`
+  collapsed to single `CR`; `CR`, `BEL 0x07`, `Ctrl-C 0x03`, `Ctrl-U`
+  etc. pass through unchanged. Output is left raw (`PRNTCRLF` `CR LF`).
+- **Tests** – `test_term_without_tty_is_clean_error` → pipe-mode success;
+  `test_fifo` mock gains `unregister`; burst test still passes.
 
 ---
 

@@ -113,14 +113,22 @@ class DispatcherTest(unittest.TestCase):
         rc, _, err = self.invoke("flush")
         self.assertEqual(rc, 0)
 
-    def test_term_without_tty_is_clean_error(self):
-        # 'z80 term' outside a real terminal must fail with a hint about
-        # ssh -t instead of a termios traceback or a hang.
-        with open("/dev/null") as devnull:
-            with mock.patch("sys.stdin", devnull):
-                rc, _, err = self.invoke("term", "--flush")
-        self.assertEqual(rc, 1)
-        self.assertIn("ssh -t", err)
+    def test_term_without_tty_pipe_mode_works(self):
+        # 'z80 term' without a tty is now pipe mode (e.g. echo "hi" | z80 term)
+        # and should succeed without the old "ssh -t" error.
+        # Use a pipe-like stdin (os.pipe) which is not a tty.
+        r, w = os.pipe()
+        os.close(w)  # EOF immediately
+        try:
+            with open(r, "rb", buffering=0) as pipe_in:
+                with mock.patch("sys.stdin", pipe_in):
+                    rc, _, err = self.invoke("term", "--flush")
+            self.assertEqual(rc, 0, err)
+        finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
 
     def test_need_root_is_clean_error(self):
         # Non-root /dev/mem access must produce a hint, not a traceback.

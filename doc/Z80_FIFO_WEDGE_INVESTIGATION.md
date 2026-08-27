@@ -1,6 +1,6 @@
 # Z80 `term` Output Wedge — Investigation Record
 
-**Status: FIXED and field-verified (2026-08) — `axi_fifo_lite` deployed; `z80 term` drain fix shipped. This document is retained as the investigation record (see §5b–§5c).**
+**Status: FIXED and field-verified (2026-08) — `axi_fifo_lite` deployed; `z80 term` drain fix shipped; PL RTS/CTS flow-control deployed (2026-08) and host CR-pacing removed — see §5b–§5d. This document is retained as the investigation record.**
 
 **Date:** 2026-07 (investigation session)
 **Symptom:** During sustained guest output bursts (NASCOM BASIC banner, FORTH
@@ -489,6 +489,45 @@ size).
 * **Host `z80 term` burst fix** — `axis_fifo` has no `f_op->poll`, so polling the FIFO fd is meaningless. Old `_cmd_term` read one byte per poll event and stalled after bursts; each keystroke was the only remaining wake-up. `demos/z80_asm/z80_board/cli.py` now polls **stdin only** (20 ms timeout) and **drains all queued packets** with non-blocking `read_available(fd, 4096)` on every wake; `hw.py`'s `read_available` uses a 4096 B buffer (≥ max `RLR`) so `EINVAL` cannot wedge the FIFO. Fixes the "each keypress releases one more byte" stall even before the Lite swap; with Lite it provides the intended interactive behaviour. 12 new tests in `demos/z80_asm/tests/test_fifo.py` (102 total).
 * **RTL hardening for Vivado DRC** — early Lite split shared state across 4× `always_ff` (legal in xsim, `last assignment wins`, but Vivado `DRC MDRV-1` flagged multiple-driver nets and aborted `opt_design`). Merged to a **single `always_ff`** driving all shared registers (`rx_cnt`, `tx_cnt`, pointers, `rvalid`, etc.). RX ingest + `RDFD` pop now handled **losslessly in the same cycle** (both pointers advance, net-zero count; 1-cycle latency — "small latency is OK if packets aren't lost"). TX path remains last-wins for `TLR` vs `axi_str_txd` pop (keystroke-rate, microsecond-rare — deferred).
 * **8 KiB ROM / 56 KiB RAM / 80 MHz FCLK** unchanged; HDMI MMCM already re-tuned (`DIVCLK 5→4`, `CLKIN 10.0→12.5 ns`) to keep 25.2/126 MHz pixel clocks at 80 MHz.
+
+## 5d. PL RTS/CTS hardware flow-control + host pacing removal (2026-08)
+
+*Problem after Lite:* TX-FIFO (1024) hid the real bottleneck — the Z80
+firmware `serBuf` (`int32k.asm` `SER_BUFSIZE=0x3F`/63, `SER_FULLSIZE=0x30`/48).
+`cat todos2.f | z80 term` in 64-byte chunks filled TX but the ISR silently
+dropped bytes when `serBuf==63` (`CP SER_BUFSIZE / JR NZ,notFull`) while
+`RTS_HIGH`/`RTS_LOW` writes to `OUT ($80),A` drove `cr_tx_ctrl` that had no
+pin. Symptom: garbled `variaoetN1u` / `? MSG #0` — TAB→space not the only
+cause (`fort forth.asm` `ENCLOSE` only splits on `BL=0x20`).
+
+*Fix — PL only (kernel `f_op->poll` still absent, deferred):*
+
+| File | Change |
+|---|---|
+| `hdl/library/z80_soc/rtl/acia68b50/acia68b50.sv` | `output logic rts_n` / `input wire cts_n`; `assign rts_n=(cr_tx_ctrl==2'b10)` (0xD6 `RTS_HIGH` at ≥48, 0x96 `RTS_LOW` at ≤5); `sr_cts=cts_n` (wire), `sr_dcd=0` |
+| `hdl/library/axis_byte_bridge/axis_byte_bridge.sv` | `input wire rx_rts_n`; `rx_valid=m_axis_tvalid && !rx_rts_n` **and** `m_axis_tready=rx_accept && !rx_rts_n` — both gated (gating only `tready` leaves `RDRF=rx_valid=1` with held word → spurious IM1 IRQ → duplicate `IN ($81)`/`rx_consume` → overflow) |
+| `hdl/library/z80_soc/z80_soc.sv` | `output wire rts_n`; `assign acia_cts_n=!io_tx_ready` (RX-FIFO vacancy: `rx_cnt<DEPTH → s_axis_tready → io_tx_ready`); `assign rts_n=acia_rts_n` |
+| `hdl/projects/ebaz4205/system_bd.tcl` | `ad_connect z80_soc_0/rts_n axis_byte_bridge_0/rx_rts_n` (after `tx_ready→io_tx_ready`) |
+| TBs | `tb_acia68b50` RTS/CTS checks, `tb_axis_byte_bridge` TEST4 (RTS stalls PS→PL while PL→PS `0xCC` still flows), `tb_z80_soc`/`tb_fifo_wedge` wiring `acia_cts_n=!bridge_tx_ready` |
+
+Separate `axi_fifo_lite` buffers are load-bearing: `rx_mem[1024]`+`tx_mem[1024]`
+(`RX` = PL→PS, `TX` = PS→PL, `TDFV`/`RDFO`, single `s_axi_aclk` 80 MHz) on
+independent `AXI_STR_TXD`/`RXD` buses, so RTS stalling `m_axis` does not block
+` s_axis` output. `CTS = !io_tx_ready` is therefore `rx_cnt<DEPTH`, not TX
+vacancy.
+
+*Verification:* `make -C hdl/library/z80_soc sim-acia` + `sim-verilator` PASS;
+`make -C hdl/library/axis_byte_bridge sim` 30 checks PASS (TEST4 proves
+separate buffers, `tx_strobe` now on `negedge` to avoid race); `./scripts/ebaz_deploy.sh --bitstream-only` programs `system_top.bit.bin` to board; cold `z80 halt; z80 reset; z80 run; cat scripts/todos2.f | ssh ebaz z80 term` now produces clean `; OK`.
+
+*Host cleanup — `demos/z80_asm/z80_board/cli.py` (2026-08, after RTS field test
+"at least as good as it used to"):* the per-`CR` quiescence block in
+`_forward_stdin_to_fifo` (`quiet_start`/`t_end+0.300s`/25 ms quiet) was the
+software workaround for the un-wired RTS; it is **deleted**. Kept: EAGAIN
+retry loop (`deadline 1.0s`, drain RX on `TDFV==0`, `5 ms` sleep) — RTS now
+makes `TDFV==0` honest back-pressure for `serBuf≥48`; `0x08→0x7F`/`0x09→0x20`/
+`0x0A→0x0D` + CRLF-collapse; pipe-EOF linger (`0.5 s` quiet, still needed to
+capture `OK` after last line). Deployed via `./demos/z80_asm/install_to_board.sh` (see install log 2026-08) — `102` host tests still OK.
 
 ## 6. Reproduction toolkit (as used in this session)
 

@@ -26,9 +26,10 @@ z80 dump ram 0x2000 64           # read RAM back as a hexdump
 z80 flush reset run              # discard FIFO, PC=0, start
 
 # Terminal
-z80 term                         # attach stdin/stdout to the Z80 I/O stream
+z80 term                         # attach stdin/stdout to the Z80 I/O stream (Ctrl-] detaches; CPU keeps running)
 z80 term --flush                 # discard buffered output before attaching
-                                  # (Ctrl-] detaches; CPU keeps running)
+echo "HELLO" | z80 term         # pipe mode also works without a TTY (LF→CR, BS→DEL)
+z80 term < script.txt            # feed a file
 
 # One-liners — commands run left to right, 'term' must be last
 z80 halt load ram counter.bin flush reset run
@@ -241,13 +242,20 @@ Same as bf2_soc — see `doc/Z80_SOC_PLAN.md` or `doc/AXIS_FIFO_BRIDGE.md`.
 3. **FIFO state between programs**: The AXI FIFO and bridge staging register
    are independent of the Z80 ctrl reset. Use `z80 flush` to reset both FIFO
    data paths and drain stale packets before a `reset run`.
-4. **Interactive**: `ssh -t ebaz z80 term` (`-t` is required for TTY).
-   Detach with Ctrl-]; the CPU keeps running. `term --flush` discards
-   buffered output first. Note: `flush` cannot clear a stale byte already
-   held in the ACIA RX register.
-   The term loop drains the FIFO on every wake (keystroke or 20 ms timeout)
-   — the axis_fifo driver has no poll support, so output keeps flowing
-   after large bursts without anyone typing.
+4. **Interactive / pipe**: `ssh -t ebaz z80 term` for a TTY (detach with
+   Ctrl-]; CPU keeps running); `echo "HELLO" | z80 term` or
+   `z80 term < script` also works without `-t` – stdin is bridged in
+   64-byte chunks and the FIFO is drained after EOF before exit.
+   Input is translated for RC2014-NASCOM / TC2014-FORTH (`const.asm`):
+   `BS 0x08` → `DEL 0x7F`, `LF 0x0A` → `CR 0x0D`, `CRLF` → `CR`; other
+   controls (`Ctrl-C`, `Ctrl-U`, `BEL`) pass through. Output is raw
+   (`PRNTCRLF` `CR LF`). `term --flush` discards buffered output first.
+   Note: `flush` cannot clear a stale byte already held in the ACIA RX
+   register. The loop drains the FIFO on every wake (keystroke or
+   20 ms timeout) — the axis_fifo driver has no poll support, so output
+   keeps flowing after large bursts without anyone typing. The banner is
+   printed before entering raw mode so the first Z80 line starts at
+   column 0.
 5. **New-style `run` ≠ legacy `run`**: on the board, `z80 run` resumes the
    CPU (no reset, no load). To restart from PC=0 use `z80 reset run`.
    `z80 run FILE.bin [options]` is the legacy one-shot compatibility path
