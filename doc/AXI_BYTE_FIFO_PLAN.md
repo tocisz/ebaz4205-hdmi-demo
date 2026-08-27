@@ -2,7 +2,7 @@
 
 **Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
 
-**Status:** `PL_DONE` — Phase 1 committed. Single-driver byte FIFO verified (30 checks, sim-acia PASS).
+**Status:** `PL_DONE` + `DRIVER_DONE` — Phase 1 (PL 8-bit) committed; Phase 2 (driver fork, poll) committed 2026-08-27 (old `axis-fifo` kept for rollback). Single-driver byte FIFO verified (30 checks, sim-acia PASS; `axi_byte_fifo.c` compiles clean with `arm-buildroot-gcc`).
 
 **Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
 
@@ -72,24 +72,23 @@ Register map after (from base `0x7C450000`):
 | `0x24` | `RLR` | RO | **deleted** — reads `0` (was `4`) |
 | `0x28` | `SRR` | WO | `0xA5` resets both |
 
-### Phase 2 — Kernel: `axi-byte-fifo` driver — Status: `PENDING`
+### Phase 2 — Kernel: `axi-byte-fifo` driver — Status: `DONE` 2026-08-27
 
-Mirror PL deletion — no length register, no word bounce, no `%4` guards.
+Mirror PL deletion — no length register, no word bounce, no `%4` guards. Old driver kept (Option A fork).
 
-- [ ] Fork or replace driver:
-  - Option A (safer, recommended): `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5
-  - Option B: in-place edit `axis-fifo.c`
-- [ ] `axi-byte-fifo.c` (from `axis-fifo.c` 470 LOC):
-  - [ ] `DRIVER_NAME "axi_byte_fifo"`, `of_match "xlnx,axi-byte-fifo-1.0"`
-  - [ ] Delete `READ_BUF_SIZE`/`WRITE_BUF_SIZE`, `tmp_buf[128]` word bounce, `TDR`/`RDR` sysfs
-  - [ ] `axis_fifo_read`: `wait_event(read_queue, RDFO>0)`, `copy_to_user` loop `for (i<min(len,RDFO)) { u8 b=ioread32(RDFD)&0xFF; tmp[i]=b; }` return `copied` bytes (no `RLR` read, no `bytes_available%4`)
-  - [ ] `axis_fifo_write`: `wait_event(write_queue, TDFV>=len)`, `copy_from_user` then `for (i<len) iowrite32(byte, TDFD)` — **no `TLR` commit**, return `len` (no `len%4` guard, no `words_to_write>tx_fifo_depth` word check → `len>DEPTH`)
-  - [ ] `axis_fifo_parse_dt`: accept `xlnx,axi-str-*-tdata-width == 8` (was `32`)
-  - [ ] `fops.poll` (new): `poll_wait(read_queue/write_queue)`, `mask|=POLLIN if RDFO`, `POLLOUT if TDFV>=1` — fixes historic `f_op->poll==NULL` (§5c)
-  - [ ] Keep `reset_ip_core` (`SRR/TDFR/RDFR` only), `misc_register` name `axi_byte_fifo_%pa` → `/dev/axi_byte_fifo_0x7c450000`, sysfs `ip_registers/{isr,ier,tdfr,tdfv,tdfd,rdfr,rdfo,rdfd,srr}` (no `tdr/rdlr/rlr`)
-- [ ] DTS: `arch/arm/boot/dts/zynq-ebaz4205.dts` (or overlay) compatible `xlnx,axi-byte-fifo-1.0`, `xlnx,rx-fifo-depth = <1024>` (bytes, was words)
-- [ ] Build: `make modules` (kernel 6.12 ADI fork), verify `modinfo axi_byte_fifo.ko`
-- [ ] Keep old `axis_fifo.ko` until cutover or delete after verification
+- [x] Fork driver: `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5 (Option B rejected)
+- [x] `axi-byte-fifo.c` (from `axis-fifo.c` 470 LOC, 19 KiB):
+  - [x] `DRIVER_NAME "axi_byte_fifo"`, `of_match "xlnx,axi-byte-fifo-1.0"` (`xlnx,axi-fifo-mm-s-4.1` removed)
+  - [x] Deleted `READ_BUF_SIZE`/`WRITE_BUF_SIZE`, `tmp_buf[128]` word bounce, `TDR`/`RDR`/`TLR`/`RLR` sysfs (kept `isr/ier/tdfr/tdfv/tdfd/rdfr/rdfo/rdfd/srr` only)
+  - [x] `axi_byte_fifo_read`: `wait_event(read_queue, RDFO>0)`, `min(len,RDFO)` bytes, `kbuf[i]=ioread32(RDFD)&0xFF` → `copy_to_user`, return `to_read` (no `RLR` read, no `bytes_available%4`, no `words/4`)
+  - [x] `axi_byte_fifo_write`: `wait_event(write_queue, TDFV>=len)`, `kmalloc(len)` → `copy_from_user` → `for (i<len) iowrite32(byte, TDFD)` — **no `TLR` commit**, return `len` (no `len%4` guard, `len>tx_fifo_depth` check now bytes → `len>DEPTH`)
+  - [x] `axi_byte_fifo_parse_dt`: accept `xlnx,axi-str-*-tdata-width == 8` (was `32`), error message updated to "only supports 8 bits (byte FIFO)"
+  - [x] `fops.poll` (new): `poll_wait(read_queue/write_queue)`, `mask|=POLLIN|POLLRDNORM if RDFO`, `POLLOUT|POLLWRNORM if TDFV>=1` — fixes historic `f_op->poll==NULL` (§5c); added `#include <linux/poll.h>`
+  - [x] Kept `reset_ip_core` (`SRR/TDFR/RDFR` + `ISR/IER`), `misc_register` name `axi_byte_fifo_%pa` → `/dev/axi_byte_fifo_0x7c450000`, sysfs `ip_registers/{isr,ier,tdfr,tdfv,tdfd,rdfr,rdfo,rdfd,srr}` (no `tdr/rdlr/rlr`); added `wake_up_interruptible` after read/write for poll waiters; `MODULE_DESCRIPTION` updated to byte-stream
+  - [x] Renamed internal symbols `axis_fifo*` → `axi_byte_fifo*` (`struct axi_byte_fifo`, `axi_byte_fifo_irq/open/close/read/write/poll/probe/remove/init/exit`, `axi_byte_fifo_attrs`, `DETECTION`)
+- [x] DTS: no manual edit — PL-generated DT from `system_bd.tcl` (`axi_byte_fifo_0 @0x7C450000`) will emit `compatible="xlnx,axi-byte-fifo-1.0"`, `xlnx,rx-fifo-depth=<1024>` (bytes) automatically on next `make sdimg`
+- [x] Build: verified `axi-byte-fifo.c` compiles clean with `arm-buildroot-linux-gnueabihf-gcc` (same flags as `axis-fifo.c`, exit 0, no warnings) — full `make modules` / `modinfo` deferred to board deploy
+- [x] Keep old `axis_fifo.ko` until cutover — `linux/drivers/staging/axis-fifo/` untouched (verified still builds, `axis-fifo.c` unchanged)
 
 ### Phase 3 — Userspace: `demos/z80_asm/z80_board` — Status: `PENDING`
 
