@@ -1,0 +1,151 @@
+# Byte-FIFO Migration — PL + Kernel + Userspace
+
+**Goal:** Replace the 32-bit packet transport (32-bit `TDATA` + `TLAST` per word, 24 bits dropped) with a true **byte-stream FIFO** — one `char` per `TDATA` beat, no packet length. **DEPTH=1024 bytes** each direction (user decision). Saves 3/4 PL BRAM and 3/4 driver bounce, simplifies `hw.py`/`cli.py`.
+
+**Status:** `PL_DONE` — Phase 1 committed. Single-driver byte FIFO verified (30 checks, sim-acia PASS).
+
+**Update 2026-08-27:** Name **`axi_byte_fifo` confirmed** — AXI is correct: PS talks **AXI4-Lite** (`s_axi_aclk`, `s_axi_awaddr/wdata/araddr` @ `0x7C450000`, `axis_fifo.ko` does `iowrite32(TDFD)/ioread32(RDFD)`) to the FIFO IP; the IP's PL side then emits **AXIS** (`axi_str_txd/rxd`, now 8-bit) to `axis_byte_bridge`/`z80_soc`. Xilinx IP is `axi_fifo_mm_s` = *AXI-MM to Stream* — `axi_` names the SW-visible MM side. Bridge keeps `axis_` because its ports are pure stream.
+
+**Naming decision:** Rename PL library to match kernel driver. Proposed unified name **`axi_byte_fifo`**:
+
+| Today | After |
+|-------|-------|
+| `hdl/library/axi_fifo_lite` (PL) | `hdl/library/axi_byte_fifo` |
+| `linux/drivers/staging/axis-fifo/axis-fifo.c` → `axis_fifo.ko`, device `/dev/axis_fifo_0x7c450000` | `linux/drivers/staging/axi-byte-fifo/axi-byte-fifo.c` → `axi_byte_fifo.ko`, device `/dev/axi_byte_fifo_0x7c450000`, DT `compatible="xlnx,axi-byte-fifo-1.0"` |
+| `hdl/library/axis_byte_bridge` | **keeps name** (bridge stays; its stream ports shrink `32b → 8b`, `TLAST` deleted) |
+
+Rationale: `axi_` (AXI-MM side) matches Xilinx `axi_fifo_mm_s`; `axis_byte_bridge` already describes the stream side — only the FIFO IP/driver need the shared `axi_byte_fifo` name so `find . -name '*byte_fifo*'` hits both. **Confirmed 2026-08-27.**
+
+Related docs: `doc/AXIS_FIFO_BRIDGE.md`, `doc/Z80_FIFO_WEDGE_INVESTIGATION.md §5b-§5d`, `hdl/library/axi_fifo_lite/README.md`.
+
+---
+
+## Current waste (why it matters)
+
+* `axi_fifo_lite.sv`: `rx_mem[1024][31:0]` + `tx_mem[1024][31:0]` = 8 KiB BRAM, only `rx_mem[*][7:0]` used → 75% dead. At `DEPTH=1024×8b` → 2 KiB.
+* `axis_byte_bridge.sv`: `m_axis_tdata[31:0]` → `rx_data=m_axis_tdata[7:0]` (upper 24 dropped), `s_axis_tdata={24'd0,byte}` → `TLAST=1` per byte.
+* `axis-fifo.c`: `READ_BUF_SIZE 128U` words = 512 B bounce, word loops `iowrite32(TDFD)` + `iowrite32(TLR=len)`, `ioread32(RLR)` + `RDFO` checks, `len%4` guards.
+* `demos/z80_asm/z80_board/hw.py`: `write_byte = bytes([b,0,0,0])`, `_low_bytes_from_words()` extracts `word[0]`.
+
+All of `TLR`/`RLR`/`TLAST`/`TDR`/`RDR` exist only to emulate packets that never carry >1 byte.
+
+---
+
+## Phases
+
+### Phase 0 — Planning & rename decision (this file) — Status: `DONE` 2026-08-27
+
+- [x] Write this plan to `doc/AXI_BYTE_FIFO_PLAN.md` (tracks progress)
+- [x] Confirm unified name `axi_byte_fifo` — **ACK 2026-08-27** (`axi_` = AXI-MM side is correct; PL side is AXIS but SW-visible port is `s_axi`, hence `axi_fifo_mm_s` heritage)
+- [x] Confirm device path & compatible change is OK (breaking — bitstream + `.ko` + `hw.py` must upgrade atomically) — implied by name ACK
+- [x] Confirm `DEPTH=1024` fixed (not 4096 for same BRAM as old 32-bit) — per prompt
+
+### Phase 1 — PL: `axi_byte_fifo` + `axis_byte_bridge` 8-bit — Status: `DONE` 2026-08-27 (hdl fd8f113e5)
+
+PL is the source of truth — driver and userspace shrink to match it.
+
+- [x] `git mv hdl/library/axi_fifo_lite hdl/library/axi_byte_fifo`
+  - [x] Rename `axi_fifo_lite.sv` → `axi_byte_fifo.sv`, module `axi_fifo_lite` → `axi_byte_fifo`
+  - [x] `axi_byte_fifo.sv`: `logic [7:0] rx_mem[DEPTH]`, `tx_mem[DEPTH]`; ports `axi_str_{txd,rxd}_tdata[7:0]`; delete `*_tlast`; `tx_pending_cnt` coalesce removed (no `TLR` commit window); `TDFD(0x10)` = immediate push to `tx_mem`, `RDFD(0x20)` = immediate pop; `TDFV(0x0C)=DEPTH-tx_cnt`, `RDFO(0x1C)=rx_cnt`; `TLR(0x14)`/`RLR(0x24)` return `0` (or trap) — no packet commit; delete `TDR`/`RDR` handling; keep offsets `0x00/04/08/18/28` identical (see map below). Keep `single always_ff` merged (MDRV-1) and coincident `AR+RDFD`/`tvalid` handling.
+  - [x] `axi_byte_fifo_ip.tcl` / `component.xml` / `xgui/axi_byte_fifo_v1_0.tcl`: `adi_ip_create axi_byte_fifo`, `TDATA` width `32→8`, delete `TLAST` from both `axi_str_*` buses (component.xml patched: TLAST portMaps + ports removed, TDATA 31→7)
+  - [x] Update `hdl/library/axi_byte_fifo/README.md` (new width, no `TLAST`/`TLR`/`RLR`, `DEPTH=1024` fixed)
+- [x] `hdl/library/axis_byte_bridge/axis_byte_bridge.sv`: ports `m_axis_tdata[7:0]`, `s_axis_tdata[7:0]`; delete `m_axis_tlast`/`s_axis_tlast`; delete `24'd0` padding + `UNUSEDSIGNAL` guards; keep RTS/CTS (`rts_n` gating `rx_valid`+`m_axis_tready`, `cts_n=!io_tx_ready`) and 1-deep `tx_stage` for strobe-vs-`tready`
+  - [x] `axis_byte_bridge_ip.tcl`: stream buses `TDATA 8`, delete `TLAST` (component.xml patched)
+- [x] `hdl/projects/ebaz4205/system_bd.tcl`: `ad_ip_instance axi_byte_fifo axi_byte_fifo_0` (was `axi_fifo_lite axi_fifo_mm_s_0`) @`0x7C450000`, re-wire `AXI_STR_TXD/RXD` (now 8-bit) — instance renamed to `axi_byte_fifo_0`, DT `compatible="xlnx,axi-byte-fifo-1.0"` pending
+- [x] Testbenches: `fifo_wedge_tb/axi_fifo_lite_sim.sv` wrapper now 8-bit (TLAST deleted) mapping `axi_fifo_mm_s_sim`→`axi_byte_fifo`; `run.tcl` updated to `../axi_byte_fifo/axi_byte_fifo.sv`; `tb_axis_byte_bridge.sv` width `8`, TLAST checks removed (full tb_fifo_wedge byte semantics deferred)
+- [x] Lint: `verilator --lint-only -Wall` axis_byte_bridge **PASS**, `verilator --lint-only -Wno-SYMRSVDWORD axi_byte_fifo.sv` 3× UNUSEDSIGNAL (awaddr/wstrb/araddr, expected) — no error, z80_soc lint SYNCASYNCNET warnings (tv80) — no error
+- [x] Sims: `make -C hdl/library/z80_soc sim-acia` **PASS (15 checks, RTS/CTS)**, `make -C hdl/library/axis_byte_bridge sim` **30 checks PASS incl. TEST4 RTS stalls m_axis only**
+
+Register map after (from base `0x7C450000`):
+
+| Off | Name | Access | New meaning |
+|-----|------|--------|-------------|
+| `0x00` | `ISR` | RO/W1C | unchanged (`0x01D00000` idle, `W1C`) |
+| `0x04` | `IER` | RW | stored, `interrupt=0` |
+| `0x08` | `TDFR` | WO | `0xA5` resets TX (`tx_cnt/wptr/rptr`) |
+| `0x0C` | `TDFV` | RO | `DEPTH - tx_cnt` bytes free |
+| `0x10` | `TDFD` | WO | **one byte** `wdata[7:0]` → TX FIFO |
+| `0x14` | `TLR` | RO/WO | **deleted** — reads `0`, writes ignored (kept for `axis-fifo.c` compat if driver not yet cut) |
+| `0x18` | `RDFR` | WO | `0xA5` resets RX |
+| `0x1C` | `RDFO` | RO | `rx_cnt` bytes occupied |
+| `0x20` | `RDFD` | RO | **one byte** pop (`rx_cnt--`) |
+| `0x24` | `RLR` | RO | **deleted** — reads `0` (was `4`) |
+| `0x28` | `SRR` | WO | `0xA5` resets both |
+
+### Phase 2 — Kernel: `axi-byte-fifo` driver — Status: `PENDING`
+
+Mirror PL deletion — no length register, no word bounce, no `%4` guards.
+
+- [ ] Fork or replace driver:
+  - Option A (safer, recommended): `cp -a linux/drivers/staging/axis-fifo linux/drivers/staging/axi-byte-fifo` + new `Kconfig` `AXI_BYTE_FIFO`, `Makefile` `obj-$(CONFIG_AXI_BYTE_FIFO) += axi-byte-fifo.o` — old driver stays for rollback until Phase 5
+  - Option B: in-place edit `axis-fifo.c`
+- [ ] `axi-byte-fifo.c` (from `axis-fifo.c` 470 LOC):
+  - [ ] `DRIVER_NAME "axi_byte_fifo"`, `of_match "xlnx,axi-byte-fifo-1.0"`
+  - [ ] Delete `READ_BUF_SIZE`/`WRITE_BUF_SIZE`, `tmp_buf[128]` word bounce, `TDR`/`RDR` sysfs
+  - [ ] `axis_fifo_read`: `wait_event(read_queue, RDFO>0)`, `copy_to_user` loop `for (i<min(len,RDFO)) { u8 b=ioread32(RDFD)&0xFF; tmp[i]=b; }` return `copied` bytes (no `RLR` read, no `bytes_available%4`)
+  - [ ] `axis_fifo_write`: `wait_event(write_queue, TDFV>=len)`, `copy_from_user` then `for (i<len) iowrite32(byte, TDFD)` — **no `TLR` commit**, return `len` (no `len%4` guard, no `words_to_write>tx_fifo_depth` word check → `len>DEPTH`)
+  - [ ] `axis_fifo_parse_dt`: accept `xlnx,axi-str-*-tdata-width == 8` (was `32`)
+  - [ ] `fops.poll` (new): `poll_wait(read_queue/write_queue)`, `mask|=POLLIN if RDFO`, `POLLOUT if TDFV>=1` — fixes historic `f_op->poll==NULL` (§5c)
+  - [ ] Keep `reset_ip_core` (`SRR/TDFR/RDFR` only), `misc_register` name `axi_byte_fifo_%pa` → `/dev/axi_byte_fifo_0x7c450000`, sysfs `ip_registers/{isr,ier,tdfr,tdfv,tdfd,rdfr,rdfo,rdfd,srr}` (no `tdr/rdlr/rlr`)
+- [ ] DTS: `arch/arm/boot/dts/zynq-ebaz4205.dts` (or overlay) compatible `xlnx,axi-byte-fifo-1.0`, `xlnx,rx-fifo-depth = <1024>` (bytes, was words)
+- [ ] Build: `make modules` (kernel 6.12 ADI fork), verify `modinfo axi_byte_fifo.ko`
+- [ ] Keep old `axis_fifo.ko` until cutover or delete after verification
+
+### Phase 3 — Userspace: `demos/z80_asm/z80_board` — Status: `PENDING`
+
+Delete the Python drop-24 shim.
+
+- [ ] `demos/z80_asm/z80_board/hw.py`:
+  - [ ] `FIFO_DEV="/dev/axi_byte_fifo_0x7c450000"` (or keep both paths with fallback), `FIFO_BASE=0x7C450000`
+  - [ ] `write_byte(fd,b)` → `os.write(fd, bytes([b & 0xFF]))` (was `bytes([b,0,0,0])`)
+  - [ ] Delete `_low_bytes_from_words()` (no `word[0]` extraction)
+  - [ ] `read_available(fd, max_bytes=4096)` → `os.read(fd,4096)` returns `list(word)` directly (was `4096` word-sized read + `_low_bytes` loop); keep `EAGAIN/EINVAL` transient handling
+  - [ ] `read_byte`, `flush_fifo`, `capture_fifo_output` unchanged except they now see bytes not words; `reset_fifo_buffers()` still `mmap` `TDFR/RDFR=0xA5`
+  - [ ] Update docstring: "byte bridge, no packet"
+- [ ] `demos/z80_asm/z80_board/cli.py`: no logic change — `hw.write_byte`/`read_available` now byte-correct, `EAGAIN` retry (`deadline 1.0s + drain RX +5ms`) is still RTS backpressure, `_INPUT_TRANSLATE={0x08:0x7F,0x09:0x20,0x0A:0x0D}` + CRLF collapse + `0.5s` pipe linger kept
+- [ ] `demos/brainfuck_org/run_bf1_program.py`: same `FIFO_DEV` update if kept
+- [ ] `demos/z80_asm/tests/test_fifo.py` + `tests/mock_board.py`: `_packet(*bytes_)` → `bytes(bytes_)` (not `b"\xNN\x00\x00\x00"`), remove word-alignment tests, keep drain/term tests
+- [ ] `demos/z80_asm/install_to_board.sh`: install `axi_byte_fifo.ko` or both, update `z80_board` package
+
+### Phase 4 — Integration wiring — Status: `PENDING`
+
+- [ ] Choose cutover strategy:
+  - **Atomic** (recommended): one `./scripts/ebaz_deploy.sh` run programs new bitstream + `rmmod axis_fifo; insmod axi_byte_fifo` + `install_to_board.sh` — old device path disappears on next reboot. Keep this plan as rollback reference.
+  - **Dual** (intermediate): new PL exposes *both* `0x7C450000` (new 8-bit) and old 32-bit alias at `0x7C460000` — not recommended, doubles BRAM.
+- [ ] `hdl/projects/ebaz4205/system_bd.tcl`: finalize instance name `axi_byte_fifo_0` vs keeping `axi_fifo_mm_s_0` alias for old DT — pick one after name ACK
+- [ ] `ADDRESS_MAP.md` / `doc/ARCHITECTURE.md` / `doc/PL_TTY_DEVICE.md` note new device path
+
+### Phase 5 — Verification — Status: `PENDING`
+
+- [ ] PL lint+sims: `verilator --lint-only`, `make -C hdl/library/z80_soc sim-acia`, `sim-verilator`, `make -C hdl/library/axis_byte_bridge sim` — 30 checks PASS, TEST4 `rts_n` still stalls PS→PL only
+- [ ] Module load: `ssh ebaz 'modprobe axi_byte_fifo && ls -l /dev/axi_byte_fifo_* && cat /sys/class/misc/axi_byte_fifo_*/ip_registers/tdfv'` → `0x400` after `SRR`, `rdfo` bytes
+- [ ] Host tests: `./demos/z80_asm/run_z80_tests.sh` → `102 OK` (updated)
+- [ ] Hardware byte-stream: `ssh ebaz 'z80 halt; z80 reset; z80 run'` + `printf 'HELLO\r' | ssh ebaz z80 term` → echo, interactive `z80 term`
+- [ ] Burst that previously needed RTS: `cat ~/repos/z80/TC2014-FORTH/scripts/todos2.f | ssh ebaz z80 term` → clean `; OK` lines (no `? MSG #0` / `variaoetN1u`), `cat` throughput now honest byte rate (no 4× write amplification)
+- [ ] `make sdimg` WNS ≥0, `report_utilization` BRAM: `axi_fifo` 8 KiB → 2 KiB (-75%)
+- [ ] Delete old driver/PL alias after verification
+
+---
+
+## Decisions log
+
+| Decision | Rationale |
+|----------|-----------|
+| `DEPTH=1024` bytes | User fixed; keeps latency identical, saves 75% BRAM. Growing to 4096 would be free (same BRAM as old 32b×1024) but deferred. |
+| Unified name `axi_byte_fifo` | `git mv`-able, matches Xilinx `axi_fifo_mm_s` (`s_axi` MM side SW-visible; PL side is AXIS `axi_str_*` but named from SW view). **Confirmed 2026-08-27.** |
+| Delete `TLR`/`RLR`/`TLAST` entirely | Atomic value = 1 byte, per prompt. Keep reads as `0` for one-release compat if needed. |
+| Add `f_op->poll` in new driver | Historic missing `poll` forced timeout-poll in `cli.py:_term_session`; now can `POLLIN`/`POLLOUT` honestly. |
+| Atomic cutover (bitstream+`.ko`+`hw.py`) | Changing `TDATA` width breaks old driver; dual mapping wastes BRAM — single reboot cutover is cleanest. Plan file is the rollback record. |
+
+## Errors encountered
+
+| Error | Attempt | Resolution |
+|-------|---------|------------|
+|       |         |            |
+
+## Notes
+
+* This plan is the progress tracker — check boxes as phases complete; do not create a second `task_plan.md` without updating this file.
+* Rename is `git mv` so history follows; Vivado IP cache `*.hw/*.cache/*.ip_user_files` regenerates.
+* Old docs `doc/Z80_FIFO_WEDGE_INVESTIGATION.md §5b-§5d` remain valid context (packet wedge + RTS fix) but this migration obsoletes `AXI_STR_* 32b` + packet language — update `doc/AXIS_FIFO_BRIDGE.md` when PL lands.
+
